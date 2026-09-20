@@ -14,18 +14,33 @@
  *
  * NOTE: getUserMedia (real torch control on Android) requires a secure
  * context — HTTPS in production, http://localhost only for local testing.
+ *
+ * Also: GET /health (uptime + connection count), giveaway state persisted
+ * to data/giveaway-state.json (crash-restart safety net, see comment
+ * below), a winner history log sent to admins, and exponential backoff on
+ * repeated failed admin-auth attempts from the same IP.
  */
 
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
 
 const app = express();
 app.set('trust proxy', true); // so req.protocol is correct behind ngrok/nginx (https)
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Simple health endpoint — lets a host (Render, a load balancer, an
+// uptime monitor) confirm the process is actually up, separate from just
+// "did the port accept a TCP connection." Useful once you're on a paid
+// Render plan that does zero-downtime deploys: it uses this to know the
+// new instance is ready before killing the old one.
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), connected: currentStats().connected });
+});
 
 // Renders a QR code pointing at this server's OWN participant page, using
 // whatever host/protocol the request actually arrived on — so the same
@@ -58,6 +73,91 @@ if (ADMIN_KEY === 'change-me') {
 const pool = new Map();
 const adminSockets = new Set();
 const viewerSockets = new Set(); // the QR/"connected screen" display — public, no auth, count only
+const adminAuthAttempts = new Map(); // ip -> { attempts, lockedUntil } — brute-force backoff for admin-auth
+
+// --- giveaway persistence ---
+// Protects against the process crashing and restarting mid-event (an
+// unhandled exception, an OOM kill) wiping every joined fan and past
+// winner. This is a safety net for a crash-restart on the SAME running
+// instance/disk — it does NOT survive a fresh deploy or a host whose
+// filesystem is wiped between runs (e.g. Render's free tier without an
+// attached persistent Disk). For that level of durability you'd need a
+// real external store (a database, or a paid Render Disk).
+const DATA_DIR = path.join(__dirname, 'data');
+const STATE_FILE = path.join(DATA_DIR, 'giveaway-state.json');
+const winnerHistory = []; // { shortId, message, timestamp, online }
+
+function loadState() {
+  try {
+    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const saved = JSON.parse(raw);
+    for (const [deviceId, entry] of Object.entries(saved.pool || {})) {
+      // ws is null until this device actually reconnects — it re-enters
+      // the live pool (with its hasWon/pendingWinMessage intact) the next
+      // time it sends a 'join', same as any other reconnect.
+      pool.set(deviceId, { ws: null, connectedAt: entry.connectedAt, hasWon: entry.hasWon, pendingWinMessage: entry.pendingWinMessage || null });
+    }
+    if (Array.isArray(saved.winnerHistory)) winnerHistory.push(...saved.winnerHistory);
+    console.log(`[state] restored ${pool.size} pool entries and ${winnerHistory.length} winner history entries from ${STATE_FILE}`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn(`[state] failed to load ${STATE_FILE}: ${err.message}`);
+    // ENOENT (no file yet) is the normal first-run case — nothing to do.
+  }
+}
+
+let stateDirty = false;
+function markStateDirty() { stateDirty = true; }
+
+async function flushState() {
+  if (!stateDirty) return;
+  stateDirty = false;
+  try {
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
+    const poolOut = {};
+    for (const [deviceId, entry] of pool.entries()) {
+      poolOut[deviceId] = { connectedAt: entry.connectedAt, hasWon: entry.hasWon, pendingWinMessage: entry.pendingWinMessage };
+    }
+    const tmp = STATE_FILE + '.tmp';
+    await fs.promises.writeFile(tmp, JSON.stringify({ pool: poolOut, winnerHistory }));
+    await fs.promises.rename(tmp, STATE_FILE); // atomic swap — avoids a half-written file if the process dies mid-write
+  } catch (err) {
+    console.warn(`[state] failed to save: ${err.message}`);
+    stateDirty = true; // retry on the next interval tick instead of silently losing the update
+  }
+}
+
+// A join wave marks state dirty on every join but only flushes on a fixed
+// interval, never per-join. An earlier version called a blocking
+// fs.writeFileSync after every mutation, debounced only to the next
+// setImmediate tick — under a 500-client burst test that measured 129
+// separate synchronous disk writes, each stalling Node's single event
+// loop thread right in the path of the cue broadcast fan-out. Interval
+// flushing bounds this to at most one async (non-blocking) write per
+// interval, however many joins happen in between.
+const STATE_FLUSH_INTERVAL_MS = 2000;
+setInterval(() => { flushState(); }, STATE_FLUSH_INTERVAL_MS);
+
+loadState();
+
+// Flush state on a graceful shutdown (Render sends SIGTERM before killing
+// the old instance on a redeploy) so a crash-restart on the same disk
+// doesn't lose the last few seconds of activity.
+function gracefulShutdown(signal) {
+  console.log(`[state] ${signal} received, saving state before exit...`);
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const poolOut = {};
+    for (const [deviceId, entry] of pool.entries()) {
+      poolOut[deviceId] = { connectedAt: entry.connectedAt, hasWon: entry.hasWon, pendingWinMessage: entry.pendingWinMessage };
+    }
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ pool: poolOut, winnerHistory }));
+  } catch (err) {
+    console.warn(`[state] failed to save on shutdown: ${err.message}`);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 function send(ws, obj) {
   if (ws && ws.readyState === 1 /* OPEN */) ws.send(JSON.stringify(obj));
@@ -113,8 +213,23 @@ function buildPattern(type) {
   }
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   ws.role = null; // 'participant' | 'admin' | 'viewer', set on first message
+
+  // Real client IP for the admin-auth rate limiter below. Behind a proxy
+  // (Render's own edge, or deploy/nginx.conf on a VPS), ws._socket.
+  // remoteAddress is the PROXY's address for every connection, not the
+  // visitor's — keying the rate limiter on that would bucket every admin
+  // login attempt from every device as "the same client," so a few wrong
+  // guesses from anyone locks out the real admin too. X-Forwarded-For is
+  // set by both Render's edge and nginx.conf's proxy_set_header; take the
+  // first (left-most, i.e. original client) address in that list, and
+  // fall back to the raw socket address for direct/local connections
+  // (e.g. running this locally with no proxy in front).
+  const forwardedFor = req.headers['x-forwarded-for'];
+  ws._clientIp = (forwardedFor ? forwardedFor.split(',')[0].trim() : null)
+    || (req.socket && req.socket.remoteAddress)
+    || 'unknown';
 
   ws.on('close', () => {
     adminSockets.delete(ws);
@@ -166,18 +281,34 @@ wss.on('connection', (ws) => {
       }
 
       broadcastStats();
+      markStateDirty();
       return;
     }
 
     // --- everything below requires admin auth ---
     if (msg.type === 'admin-auth') {
+      const ip = ws._clientIp;
+      const lock = adminAuthAttempts.get(ip);
+      if (lock && lock.lockedUntil > Date.now()) {
+        send(ws, { type: 'admin-auth-fail', retryAfterMs: lock.lockedUntil - Date.now() });
+        return;
+      }
       if (msg.key === ADMIN_KEY) {
+        adminAuthAttempts.delete(ip); // successful login clears any prior failed-attempt count
         ws.role = 'admin';
         adminSockets.add(ws);
         send(ws, { type: 'admin-auth-ok' });
         send(ws, currentStats());
+        send(ws, { type: 'winner-history', history: winnerHistory });
       } else {
-        send(ws, { type: 'admin-auth-fail' });
+        const attempts = (lock ? lock.attempts : 0) + 1;
+        // Exponential backoff after repeated failures from the same IP:
+        // no delay for the first few honest typos, then 2s/4s/8s/...
+        // capped at 60s. Slows brute-forcing a short key without locking
+        // out someone who just fat-fingered it once or twice.
+        const lockMs = attempts > 3 ? Math.min(60000, 2 ** (attempts - 3) * 1000) : 0;
+        adminAuthAttempts.set(ip, { attempts, lockedUntil: Date.now() + lockMs });
+        send(ws, { type: 'admin-auth-fail', retryAfterMs: lockMs });
       }
       return;
     }
@@ -237,6 +368,10 @@ wss.on('connection', (ws) => {
         entry.pendingWinMessage = message; // delivered next time this device reconnects
       }
 
+      const historyEntry = { shortId: deviceId.slice(0, 8), message, timestamp: Date.now(), online };
+      winnerHistory.push(historyEntry);
+      for (const a of adminSockets) send(a, { type: 'winner-history', history: winnerHistory });
+
       send(ws, {
         type: 'winner-picked',
         shortId: deviceId.slice(0, 8),
@@ -244,14 +379,28 @@ wss.on('connection', (ws) => {
         message,
       });
       console.log(`[admin] winner picked: ${deviceId.slice(0, 8)} (online=${online})`);
+      markStateDirty();
+      flushState(); // rare, high-value event — don't wait for the periodic interval
       return;
     }
 
     if (msg.type === 'reset-giveaway') {
-      pool.clear();
+      // Reset giveaway ELIGIBILITY only — do not drop currently-connected
+      // devices from the pool. pool doubles as both "who gets cues" and
+      // "who's in the giveaway," so clearing it outright used to silently
+      // stop already-joined fans from receiving any further light cues
+      // until they manually refreshed and rejoined — a real problem if
+      // this is used mid-event (the README documents it as exactly that:
+      // "between your small-group test and the full arena test").
+      for (const entry of pool.values()) {
+        entry.hasWon = false;
+        entry.pendingWinMessage = null;
+      }
       broadcastStats();
       send(ws, { type: 'giveaway-reset-ok' });
-      console.log('[admin] giveaway pool reset');
+      console.log('[admin] giveaway pool reset (eligibility only — connected devices stay in the pool and keep receiving cues)');
+      markStateDirty();
+      flushState(); // same — flush immediately rather than waiting up to 2s
       return;
     }
   });

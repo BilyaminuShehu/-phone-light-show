@@ -187,13 +187,22 @@ function connect() {
     if (msg.type === 'winner') {
       winnerText.textContent = msg.message;
       winnerOverlay.style.display = 'flex';
+      // A fan holding their phone up for the light show may not be
+      // looking at the screen the instant they win — a vibration pattern
+      // gets their attention. Silently does nothing on iOS Safari / any
+      // browser without the Vibration API, so this is purely additive.
+      try { if (navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 400]); } catch {}
     }
   });
 
   ws.addEventListener('close', () => {
     synced = false;
     setStatus('Disconnected — reconnecting…', false);
-    setTimeout(connect, 1500); // simple fixed-backoff reconnect
+    // Randomized delay (1000-2500ms) instead of a fixed 1500ms — if the
+    // server restarts, every connected phone hitting reconnect at the
+    // exact same instant is a "thundering herd" that slams the server
+    // the moment it comes back up. Jitter spreads that out.
+    setTimeout(connect, 1000 + Math.random() * 1500);
   });
 
   ws.addEventListener('error', () => ws.close());

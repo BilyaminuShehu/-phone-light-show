@@ -49,7 +49,7 @@ function connect() {
       el.className = msg.live ? 'live' : 'idle';
     }
   });
-  ws.addEventListener('close', () => setTimeout(connect, 1500));
+  ws.addEventListener('close', () => setTimeout(connect, 1000 + Math.random() * 1500)); // jittered — see public/index.html for why
 }
 connect();
 </script>

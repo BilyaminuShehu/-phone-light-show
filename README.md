@@ -74,6 +74,10 @@ Three pages, three tabs to test with:
   admin key before showing any controls. **Don't skip setting `ADMIN_KEY`**
   — anyone who finds `/admin.html` without it can start/stop the show and
   run the giveaway (see "Admin access" below).
+- `http://localhost:3000/health` — plain JSON status (`{status, uptime,
+  connected}`), not a page you'd open by hand. Useful for an uptime monitor
+  or, on a paid Render plan with zero-downtime deploys, for Render itself
+  to confirm the new instance is ready before killing the old one.
 
 ## Test with a real phone
 
@@ -123,6 +127,12 @@ who finds the URL can end the giveaway or spam-trigger effects." Change the
 default before any real event — the server prints a loud warning on startup
 if you don't.
 
+Repeated wrong-key attempts from the same client IP get exponential
+backoff (a few free tries, then 2s/4s/8s/... capped at 60s) — see
+`adminAuthAttempts` in `server.js`. This is per real client IP, taken from
+`X-Forwarded-For` when running behind a proxy (Render, or `deploy/nginx.conf`
+on a VPS) so one person's typos don't lock out the actual admin too.
+
 ## Giveaway mechanics
 
 - **Entry**: happens on the explicit "Join the Light Show" tap, not just on
@@ -144,13 +154,27 @@ if you don't.
   number or a one-time code, which is a bigger v2 feature, not a v1 tweak.
 - **Winner selection**: random among devices that haven't already won
   (`server.js`, `pick-winner`), so the same device can't be drawn twice
-  across multiple draws in one session. `reset-giveaway` clears the whole
-  pool — use it between your small-group test and the full arena test so
-  test entries don't linger into the real draw.
+  across multiple draws in one session. `reset-giveaway` clears every
+  device's past-winner status (so everyone becomes eligible again) — it
+  does NOT disconnect anyone or clear the live connected count; devices
+  already joined keep receiving cues. Use it between your small-group
+  test and the full arena test so test winners don't block real ones,
+  or between multiple giveaway rounds in the same event.
 - **Winner delivery**: if the winning device is currently connected, the
   message is pushed immediately. If it dropped (closed the tab, lost
   signal), the message is queued server-side and delivered automatically
   the moment that same device id reconnects — no re-draw needed.
+- **Persistence**: the pool and winner history are flushed to
+  `data/giveaway-state.json` (async, at most every 2s, plus immediately
+  after a winner pick or reset) and restored on startup. This is a
+  crash-restart safety net on the SAME disk — an unhandled exception or
+  OOM kill won't wipe the giveaway. It is NOT a substitute for a real
+  database: a fresh deploy, or a host with an ephemeral filesystem (Render
+  free tier without an attached persistent Disk), wipes `data/` regardless
+  of this. `.gitignore` excludes `data/` — it's runtime state, not code.
+- **Winner history**: `admin.html` shows a running log of every pick
+  (timestamp, device, delivered-live vs. queued, message) with an "Export
+  as text" button for a downloadable record after the event.
 
 ## Scaling decision: single instance, not a cluster
 

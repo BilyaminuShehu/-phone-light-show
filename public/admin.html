@@ -89,8 +89,11 @@
   <h2>Giveaway</h2>
   <input type="text" id="winMsg" value="🎉 Congratulations! You've won a Göztepe jersey — please come to the fan desk." />
   <button onclick="pickWinner()">🎁 Pick random winner</button>
-  <button class="secondary" onclick="resetGiveaway()">Reset giveaway pool</button>
+  <button class="secondary" onclick="resetGiveaway()">Reset winner eligibility</button>
   <p id="winnerResult"></p>
+
+  <h3>Winner history <button class="secondary" style="font-size:12px; padding:6px 10px;" onclick="exportWinnerHistory()">Export as text</button></h3>
+  <div id="winnerHistoryList" style="font-size:13px; opacity:0.85;">No winners picked yet.</div>
 
   <h2>Log</h2>
   <div id="log"></div>
@@ -161,7 +164,9 @@ function connectWS() {
       log(`Song will start in sync with the lights (~${Math.round(localDelay)}ms).`);
     }
     if (msg.type === 'admin-auth-fail') {
-      document.getElementById('gateMsg').textContent = 'Wrong key.';
+      document.getElementById('gateMsg').textContent = msg.retryAfterMs
+        ? `Too many wrong attempts — wait ${Math.ceil(msg.retryAfterMs / 1000)}s and try again.`
+        : 'Wrong key.';
     }
     if (msg.type === 'stats') {
       document.getElementById('connectedN').textContent = msg.connected;
@@ -177,9 +182,10 @@ function connectWS() {
         log(`Winner picked: ${msg.shortId} (online=${msg.online})`);
       }
     }
-    if (msg.type === 'giveaway-reset-ok') log('Giveaway pool reset.');
+    if (msg.type === 'giveaway-reset-ok') log('Winner eligibility reset — connected phones stay joined.');
+    if (msg.type === 'winner-history') renderWinnerHistory(msg.history);
   });
-  ws.addEventListener('close', () => setTimeout(connectWS, 1500));
+  ws.addEventListener('close', () => setTimeout(connectWS, 1000 + Math.random() * 1500)); // jittered — see public/index.html for why
 }
 connectWS();
 
@@ -278,8 +284,34 @@ function pickWinner() {
   const message = document.getElementById('winMsg').value;
   ws.send(JSON.stringify({ type: 'pick-winner', message }));
 }
+let latestWinnerHistory = [];
+function renderWinnerHistory(history) {
+  latestWinnerHistory = history || [];
+  const el = document.getElementById('winnerHistoryList');
+  if (!latestWinnerHistory.length) { el.textContent = 'No winners picked yet.'; return; }
+  el.innerHTML = ''; // clear, then build with textContent per row — avoids injecting the admin-entered message as raw HTML
+  latestWinnerHistory.slice().reverse().forEach((h) => {
+    const row = document.createElement('div');
+    row.textContent = `${new Date(h.timestamp).toLocaleString()} — device ${h.shortId} — ${h.online ? 'delivered live' : 'queued (was offline)'} — "${h.message}"`;
+    el.appendChild(row);
+  });
+}
+
+function exportWinnerHistory() {
+  if (!latestWinnerHistory.length) { log('No winner history to export yet.'); return; }
+  const text = latestWinnerHistory
+    .map(h => `${new Date(h.timestamp).toISOString()}\t${h.shortId}\t${h.online ? 'delivered' : 'queued'}\t${h.message}`)
+    .join('\n');
+  const blob = new Blob([text], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `winner-history-${Date.now()}.txt`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function resetGiveaway() {
-  if (!confirm('Clear all giveaway entries? This cannot be undone.')) return;
+  if (!confirm('Make everyone eligible to win again? Currently-connected phones stay joined and keep receiving cues — this only clears past-winner status, it does not disconnect anyone or wipe the connected count. This cannot be undone.')) return;
   ws.send(JSON.stringify({ type: 'reset-giveaway' }));
 }
 </script>
