@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Scan to join the light show</title>
+<style>
+  html, body { margin:0; height:100%; background:#0a0a0a; color:#eee;
+    font-family: -apple-system, system-ui, sans-serif; }
+  #wrap { height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; text-align:center; padding:24px; box-sizing:border-box; }
+  h1 { font-size:clamp(24px, 4vw, 44px); margin:0 0 8px; }
+  p.sub { opacity:0.65; margin:0 0 28px; font-size:clamp(14px, 2vw, 20px); }
+  #qrBox { background:#fff; padding:20px; border-radius:20px; box-shadow:0 0 60px rgba(255,255,255,0.08); }
+  #qrBox img { display:block; width:min(60vw, 420px); height:auto; }
+  #url { margin-top:20px; font-size:clamp(14px, 1.6vw, 18px); opacity:0.7; word-break:break-all; }
+  #count { margin-top:32px; font-size:clamp(20px, 3vw, 32px); font-weight:700; }
+  #countLabel { font-size:14px; opacity:0.6; font-weight:400; }
+  #status { margin-top:16px; padding:8px 20px; border-radius:999px; font-size:14px; font-weight:600; }
+  #status.idle { background:#262626; color:#999; }
+  #status.live { background:#e11d48; color:#fff; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <h1>🔦 Scan to join the Light Show</h1>
+    <p class="sub">No app needed — just your phone's camera</p>
+    <div id="qrBox"><img id="qrImg" src="/qr.png" alt="QR code" /></div>
+    <div id="url"></div>
+    <div id="count"><span id="countN">0</span><br/><span id="countLabel">fans connected</span></div>
+    <div id="status" class="idle">Waiting to start</div>
+  </div>
+
+<script>
+document.getElementById('url').textContent = `${location.protocol}//${location.host}/`;
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
+  ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'viewer' })));
+  ws.addEventListener('message', (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'public-stats') {
+      document.getElementById('countN').textContent = msg.connected;
+    }
+    if (msg.type === 'show-status') {
+      const el = document.getElementById('status');
+      el.textContent = msg.live ? '🔴 Live now!' : 'Waiting to start';
+      el.className = msg.live ? 'live' : 'idle';
+    }
+  });
+  ws.addEventListener('close', () => setTimeout(connect, 1500));
+}
+connect();
+</script>
+</body>
+</html>

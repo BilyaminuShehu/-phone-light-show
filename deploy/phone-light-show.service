@@ -1,0 +1,35 @@
+# systemd unit — process resilience for the single Node instance.
+# Install:
+#   sudo cp phone-light-show.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now phone-light-show
+#
+# If the process crashes mid-show (unhandled exception, OOM, whatever),
+# systemd restarts it in ~2s instead of the show silently dying. Clients
+# will auto-reconnect (browser WebSocket + a small retry loop — see the
+# note in public/index.html if you want to harden that further) and
+# re-run clock sync against the new process.
+
+[Unit]
+Description=Phone Light Show server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/phone-light-show
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=2
+Environment=PORT=3000
+Environment=NODE_ENV=production
+# REQUIRED: set this to a real secret before enabling the service — systemd
+# does not inherit your shell's env vars, so without this line the process
+# silently falls back to server.js's default ('change-me') admin key.
+Environment=ADMIN_KEY=CHANGE-THIS-BEFORE-DEPLOYING
+
+# Modest hardening — adjust if your distro's systemd is older.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

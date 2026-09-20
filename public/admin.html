@@ -1,0 +1,287 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Light Show — Admin</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; padding:24px; max-width:640px; margin:0 auto; }
+  h2 { margin-top:32px; border-bottom:1px solid #333; padding-bottom:8px; }
+  h2:first-of-type { margin-top:0; }
+  button { font-size:15px; padding:11px 18px; margin:6px 6px 6px 0; border-radius:8px; border:none;
+    background:#e11d48; color:#fff; cursor:pointer; }
+  button.secondary { background:#333; }
+  button:disabled { opacity:0.4; cursor:default; }
+  input[type=text] { font-size:15px; padding:10px; border-radius:8px; border:1px solid #444;
+    background:#1a1a1a; color:#eee; width:100%; box-sizing:border-box; margin-bottom:8px; }
+  select { font-size:15px; padding:10px; border-radius:8px; background:#1a1a1a; color:#eee; border:1px solid #444; }
+  .stats { display:flex; gap:24px; margin:12px 0; }
+  .stat { background:#1a1a1a; border-radius:10px; padding:14px 20px; flex:1; }
+  .stat .n { font-size:28px; font-weight:700; }
+  .stat .l { font-size:12px; opacity:0.6; }
+  #log { font-family: ui-monospace, monospace; font-size:12px; background:#000; border-radius:8px;
+    padding:12px; height:140px; overflow-y:auto; white-space:pre-wrap; }
+  #gate { position:fixed; inset:0; background:#111; z-index:5; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:12px; }
+  #gate input { width:220px; }
+  .warn { font-size:12px; color:#f59e0b; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h3>Admin access</h3>
+  <input type="text" id="keyInput" placeholder="Admin key" autofocus />
+  <button onclick="authenticate()">Enter</button>
+  <p id="gateMsg" class="warn"></p>
+</div>
+
+<div id="panel" style="display:none">
+  <h2>Live status</h2>
+  <div class="stats">
+    <div class="stat"><div class="n" id="connectedN">0</div><div class="l">connected now</div></div>
+    <div class="stat"><div class="n" id="entriesN">0</div><div class="l">giveaway entries</div></div>
+  </div>
+
+  <h2>Show control</h2>
+  <div>
+    <select id="modeSelect">
+      <option value="solid">Solid on</option>
+      <option value="pulse">Pulse (breathing)</option>
+    </select>
+    <select id="speedSelect">
+      <option value="900">Slow pulse</option>
+      <option value="600" selected>Medium pulse</option>
+      <option value="450">Fast pulse</option>
+    </select>
+    <br/>
+    <button onclick="showStart()">▶ Start show</button>
+    <button class="secondary" onclick="showStop()">■ Stop show</button>
+  </div>
+  <p class="warn">Continuous mode only offers solid/pulse — no continuous strobe, to avoid extended rapid flashing.</p>
+
+  <h3>Quick one-off effects</h3>
+  <button class="secondary" onclick="trigger('flash')">Single flash</button>
+  <button class="secondary" onclick="trigger('strobe')">Short strobe (~2s)</button>
+  <button class="secondary" onclick="trigger('pulse-slow')">4x slow pulse</button>
+
+  <h2>Sync to a song</h2>
+  <p class="warn">
+    The song should play from ONE shared source everyone in the room can
+    hear — this laptop's speaker, or a Bluetooth speaker — not from each
+    phone. Phones only sync their flashing to it; that's how real stadiums
+    do it too (one PA, not thousands of phone speakers trying to stay in
+    audio sync with each other).
+  </p>
+  <input type="file" id="audioFile" accept="audio/*" />
+  <audio id="player" controls style="width:100%; margin:10px 0;"></audio>
+  <div>
+    <button class="secondary" onclick="tapTempo()">👆 Tap tempo</button>
+    <input type="text" id="bpmInput" value="120" style="width:70px; text-align:center;" /> BPM
+    <label style="font-size:13px; margin-left:8px;">
+      <input type="checkbox" id="halfTime" /> half-time (for fast songs)
+    </label>
+  </div>
+  <p id="bpmHint" class="warn"></p>
+  <button onclick="playAndSync()">▶ Play song + start lights</button>
+  <button class="secondary" onclick="stopSong()">■ Stop</button>
+
+  <h2>Giveaway</h2>
+  <input type="text" id="winMsg" value="🎉 Congratulations! You've won a Göztepe jersey — please come to the fan desk." />
+  <button onclick="pickWinner()">🎁 Pick random winner</button>
+  <button class="secondary" onclick="resetGiveaway()">Reset giveaway pool</button>
+  <p id="winnerResult"></p>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+let ws;
+// Magic link support: open admin.html?key=YOUR_KEY to skip typing the key
+// entirely. Falls back to whatever was entered/remembered in this browser.
+const urlKey = new URLSearchParams(location.search).get('key');
+let adminKey = urlKey || sessionStorage.getItem('light-show-admin-key') || '';
+if (urlKey) {
+  document.getElementById('gate').innerHTML = '<h3>Signing you in…</h3>';
+}
+
+function log(line) {
+  const el = document.getElementById('log');
+  el.textContent += `[${new Date().toLocaleTimeString()}] ${line}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+// Same clock-sync trick the phones use (see public/index.html) — lets the
+// admin schedule local audio.play() against the exact instant the phones
+// will start flashing, instead of the two drifting apart.
+let clockOffset = 0;
+function syncAdminClock() {
+  const samples = [];
+  let count = 0;
+  const tryPing = () => {
+    const t0 = Date.now();
+    const handler = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type !== 'pong') return;
+      const rtt = Date.now() - t0;
+      samples.push({ rtt, offset: (msg.serverTime + rtt / 2) - Date.now() });
+      ws.removeEventListener('message', handler);
+      count++;
+      if (count < 5) setTimeout(tryPing, 150);
+      else {
+        samples.sort((a, b) => a.rtt - b.rtt);
+        clockOffset = samples[0].offset;
+      }
+    };
+    ws.addEventListener('message', handler);
+    ws.send(JSON.stringify({ type: 'ping', clientSendTime: t0 }));
+  };
+  tryPing();
+}
+
+function connectWS() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
+  ws.addEventListener('open', () => {
+    if (adminKey) ws.send(JSON.stringify({ type: 'admin-auth', key: adminKey }));
+  });
+  ws.addEventListener('message', (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'admin-auth-ok') {
+      document.getElementById('gate').style.display = 'none';
+      document.getElementById('panel').style.display = 'block';
+      sessionStorage.setItem('light-show-admin-key', adminKey);
+      syncAdminClock();
+      log('Authenticated.');
+    }
+    if (msg.type === 'show-start-ack') {
+      const player = document.getElementById('player');
+      const localDelay = Math.max(0, (msg.startAt - clockOffset) - Date.now());
+      setTimeout(() => player.play().catch((e) => log(`Audio play blocked: ${e.message} — tap the audio player's own play button once, then retry.`)), localDelay);
+      log(`Song will start in sync with the lights (~${Math.round(localDelay)}ms).`);
+    }
+    if (msg.type === 'admin-auth-fail') {
+      document.getElementById('gateMsg').textContent = 'Wrong key.';
+    }
+    if (msg.type === 'stats') {
+      document.getElementById('connectedN').textContent = msg.connected;
+      document.getElementById('entriesN').textContent = msg.entries;
+    }
+    if (msg.type === 'winner-picked') {
+      const r = document.getElementById('winnerResult');
+      if (msg.error) {
+        r.textContent = msg.error;
+        log(`Pick winner failed: ${msg.error}`);
+      } else {
+        r.textContent = `Winner: device ${msg.shortId} — ${msg.online ? 'message delivered live' : 'device offline, message queued for next reconnect'}`;
+        log(`Winner picked: ${msg.shortId} (online=${msg.online})`);
+      }
+    }
+    if (msg.type === 'giveaway-reset-ok') log('Giveaway pool reset.');
+  });
+  ws.addEventListener('close', () => setTimeout(connectWS, 1500));
+}
+connectWS();
+
+function authenticate() {
+  adminKey = document.getElementById('keyInput').value.trim();
+  if (!adminKey) return;
+  if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'admin-auth', key: adminKey }));
+}
+
+const CONNECTED_N = () => Number(document.getElementById('connectedN').textContent || 0);
+
+function warnIfNobodyConnected() {
+  if (CONNECTED_N() === 0) {
+    log('⚠ 0 phones connected right now — nobody has anything to show. Open the join link on a phone and tap "Join" first.');
+    return true;
+  }
+  return false;
+}
+
+function trigger(pattern) {
+  warnIfNobodyConnected();
+  ws.send(JSON.stringify({ type: 'trigger', pattern }));
+  log(`Triggered: ${pattern} — fires on ${CONNECTED_N()} phone(s) in ~2.5s (not on this admin screen)`);
+}
+function showStart() {
+  warnIfNobodyConnected();
+  const mode = document.getElementById('modeSelect').value;
+  const intervalMs = Number(document.getElementById('speedSelect').value);
+  ws.send(JSON.stringify({ type: 'show-start', mode, intervalMs }));
+  log(`Show started: mode=${mode} interval=${intervalMs}ms — starts on ${CONNECTED_N()} phone(s) in ~2.5s`);
+}
+function showStop() {
+  ws.send(JSON.stringify({ type: 'show-stop' }));
+  document.getElementById('player').pause();
+  log('Show stopped.');
+}
+
+// --- Sync to a song ---
+document.getElementById('audioFile').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('player').src = URL.createObjectURL(file);
+  log(`Loaded song: ${file.name}`);
+});
+
+let tapTimes = [];
+function tapTempo() {
+  const now = Date.now();
+  if (tapTimes.length && now - tapTimes[tapTimes.length - 1] > 2000) tapTimes = []; // idle reset
+  tapTimes.push(now);
+  if (tapTimes.length > 8) tapTimes.shift();
+  if (tapTimes.length >= 2) {
+    const intervals = [];
+    for (let i = 1; i < tapTimes.length; i++) intervals.push(tapTimes[i] - tapTimes[i - 1]);
+    const avgMs = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    document.getElementById('bpmInput').value = Math.round(60000 / avgMs);
+  }
+  document.getElementById('bpmHint').textContent = `${tapTimes.length} tap(s) — keep tapping in time with the song for a few more beats`;
+}
+
+function bpmToIntervalMs() {
+  const bpm = Math.max(1, Number(document.getElementById('bpmInput').value) || 120);
+  const halfTime = document.getElementById('halfTime').checked;
+  let intervalMs = Math.round(60000 / bpm) * (halfTime ? 2 : 1);
+  const clamped = Math.max(400, Math.min(1200, intervalMs));
+  if (clamped !== intervalMs) {
+    document.getElementById('bpmHint').textContent =
+      `${bpm} BPM is ${intervalMs < 400 ? 'faster' : 'slower'} than the light pulse supports — using ${clamped}ms instead` +
+      (intervalMs < 400 ? ' (try checking "half-time")' : '');
+  }
+  return clamped;
+}
+
+function playAndSync() {
+  const player = document.getElementById('player');
+  if (!player.src) { log('⚠ No song loaded — choose an audio file first.'); return; }
+  if (warnIfNobodyConnected()) { /* still proceed — useful to preview solo */ }
+
+  // Unlock audio playback for this element inside the actual click gesture,
+  // so the *delayed* play() call below (fired ~2.5s later, once the phones'
+  // cue lead time has elapsed) isn't blocked by mobile autoplay policies —
+  // browsers require the FIRST play() to happen synchronously in a user
+  // gesture, but allow later programmatic play() once that's happened once.
+  player.currentTime = 0;
+  player.play().then(() => player.pause()).catch(() => {});
+
+  const intervalMs = bpmToIntervalMs();
+  ws.send(JSON.stringify({ type: 'show-start', mode: 'pulse', intervalMs }));
+  log(`Requested sync start at ${intervalMs}ms/beat — waiting for server timing...`);
+}
+
+function stopSong() {
+  showStop();
+}
+function pickWinner() {
+  const message = document.getElementById('winMsg').value;
+  ws.send(JSON.stringify({ type: 'pick-winner', message }));
+}
+function resetGiveaway() {
+  if (!confirm('Clear all giveaway entries? This cannot be undone.')) return;
+  ws.send(JSON.stringify({ type: 'reset-giveaway' }));
+}
+</script>
+</body>
+</html>

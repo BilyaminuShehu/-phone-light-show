@@ -1,0 +1,218 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Light Show</title>
+<style>
+  html, body { margin:0; height:100%; background:#0a0a0a; color:#eee;
+    font-family: -apple-system, system-ui, sans-serif; overflow:hidden; }
+  #flash { position:fixed; inset:0; background:#000; transition: background-color 0.05s linear; }
+  #ui { position:relative; z-index:2; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; height:100%; text-align:center; padding:24px; box-sizing:border-box; }
+  h2 { margin:0 0 8px; }
+  p.sub { opacity:0.65; font-size:14px; max-width:320px; margin:0 0 24px; }
+  button { font-size:19px; font-weight:600; padding:16px 36px; border-radius:14px; border:none;
+    background:#e11d48; color:white; }
+  button:disabled { opacity:0.5; }
+  #status { font-size:13px; opacity:0.6; margin-top:18px; max-width:320px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#4ade80; margin-right:6px;
+    vertical-align:middle; }
+  .dot.off { background:#555; }
+  #winnerOverlay { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,0.92);
+    display:none; align-items:center; justify-content:center; flex-direction:column; text-align:center; padding:24px; }
+  #winnerOverlay h1 { font-size:34px; margin:0 0 12px; }
+  #winnerOverlay p { font-size:17px; max-width:320px; }
+  #winnerOverlay button { margin-top:24px; background:#333; }
+</style>
+</head>
+<body>
+  <div id="flash"></div>
+  <div id="ui">
+    <h2>🔦 Light Show</h2>
+    <p class="sub">Tap join and hold your phone up — no app, no sign-up, just this page.</p>
+    <button id="joinBtn">Join the Light Show</button>
+    <div id="status"><span class="dot off"></span>Connecting…</div>
+  </div>
+
+  <div id="winnerOverlay">
+    <h1>🎉</h1>
+    <p id="winnerText"></p>
+    <button id="winnerCloseBtn">Close</button>
+  </div>
+
+<script>
+const statusEl = document.getElementById('status');
+const flashEl = document.getElementById('flash');
+const joinBtn = document.getElementById('joinBtn');
+const winnerOverlay = document.getElementById('winnerOverlay');
+const winnerText = document.getElementById('winnerText');
+document.getElementById('winnerCloseBtn').addEventListener('click', () => {
+  winnerOverlay.style.display = 'none';
+});
+
+// --- persistent per-device id (this is the giveaway de-dup key) ---
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem('light-show-device-id');
+    if (!id) {
+      id = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      localStorage.setItem('light-show-device-id', id);
+    }
+    return id;
+  } catch {
+    // localStorage unavailable (private mode edge cases) — falls back to a
+    // per-tab-session id, which means this device could re-enter the
+    // giveaway on a fresh tab. Known v1 limitation, not fixed here.
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+}
+const deviceId = getDeviceId();
+
+// iOS Safari exposes no web API for the camera torch at all — skip the
+// camera permission prompt entirely on iOS and go straight to screen-flash.
+// This keeps the "as few steps as possible" requirement true for the
+// biggest platform where torch isn't an option anyway.
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.userAgent.includes('Mac') && 'ontouchend' in document); // iPadOS reports as Mac
+
+let torchTrack = null;
+let offset = 0;
+let synced = false;
+let hasJoined = false; // becomes true only after the explicit Join tap
+let showTimer = null; // interval handle for continuous show-start mode
+let ws;
+
+function setLight(on) {
+  if (torchTrack) {
+    torchTrack.applyConstraints({ advanced: [{ torch: on }] }).catch(() => {});
+  }
+  flashEl.style.background = on ? '#ffffff' : '#000000';
+}
+
+async function enableTorchIfPossible() {
+  if (isIOS) return false;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.torch) { torchTrack = track; return true; }
+    track.stop();
+    return false;
+  } catch {
+    return false; // permission denied / no camera — screen flash still works
+  }
+}
+
+function setStatus(text, on) {
+  statusEl.innerHTML = `<span class="dot ${on ? '' : 'off'}"></span>${text}`;
+}
+
+function syncClock() {
+  return new Promise((resolve) => {
+    const samples = [];
+    let count = 0;
+    const tryPing = () => {
+      const t0 = Date.now();
+      const handler = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type !== 'pong') return;
+        const rtt = Date.now() - t0;
+        samples.push({ rtt, offset: (msg.serverTime + rtt / 2) - Date.now() });
+        ws.removeEventListener('message', handler);
+        count++;
+        if (count < 5) setTimeout(tryPing, 150);
+        else {
+          samples.sort((a, b) => a.rtt - b.rtt);
+          offset = samples[0].offset;
+          synced = true;
+          resolve();
+        }
+      };
+      ws.addEventListener('message', handler);
+      ws.send(JSON.stringify({ type: 'ping', clientSendTime: t0 }));
+    };
+    tryPing();
+  });
+}
+
+function runPattern(pattern, startAt) {
+  pattern.forEach((step) => {
+    const delay = Math.max(0, (startAt + step.t) - offset - Date.now());
+    setTimeout(() => setLight(step.on), delay);
+  });
+}
+
+function startContinuousShow(startAt, mode, intervalMs) {
+  stopContinuousShow();
+  const localStart = Math.max(0, startAt - offset - Date.now());
+  setTimeout(() => {
+    if (mode === 'solid') {
+      setLight(true);
+    } else {
+      let on = true;
+      setLight(true);
+      showTimer = setInterval(() => { on = !on; setLight(on); }, intervalMs);
+    }
+  }, localStart);
+}
+
+function stopContinuousShow() {
+  if (showTimer) { clearInterval(showTimer); showTimer = null; }
+  setLight(false);
+}
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
+
+  ws.addEventListener('open', async () => {
+    setStatus(hasJoined ? 'Reconnected. Syncing…' : 'Connected.', false);
+    await syncClock();
+    if (hasJoined) {
+      // Reconnect after a drop — rejoin automatically (same deviceId, so
+      // this can't create a second giveaway entry) so the show keeps working
+      // without another tap.
+      ws.send(JSON.stringify({ type: 'join', deviceId }));
+      setStatus('Ready — waiting for the show to start', true);
+    } else {
+      setStatus('Tap the button to join', true);
+    }
+  });
+
+  ws.addEventListener('message', (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'cue' && synced) runPattern(msg.pattern, msg.startAt);
+    if (msg.type === 'show-start' && synced) startContinuousShow(msg.startAt, msg.mode, msg.intervalMs);
+    if (msg.type === 'show-stop') stopContinuousShow();
+    if (msg.type === 'winner') {
+      winnerText.textContent = msg.message;
+      winnerOverlay.style.display = 'flex';
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    synced = false;
+    setStatus('Disconnected — reconnecting…', false);
+    setTimeout(connect, 1500); // simple fixed-backoff reconnect
+  });
+
+  ws.addEventListener('error', () => ws.close());
+}
+
+connect();
+
+joinBtn.addEventListener('click', async () => {
+  joinBtn.disabled = true;
+  joinBtn.textContent = 'Joining…';
+  hasJoined = true;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'join', deviceId }));
+  const gotTorch = await enableTorchIfPossible();
+  joinBtn.textContent = "You're in ✓";
+  setStatus(
+    gotTorch ? 'Flashlight enabled 🔦 — waiting for the show' : 'Screen-flash mode ready — waiting for the show',
+    true
+  );
+});
+</script>
+</body>
+</html>
