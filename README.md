@@ -1,9 +1,10 @@
 # Phone Light Show — MVP prototype
 
-Fan journey: **scan QR → open page, no app → tap Join (no stand/section/row/
-seat picker) → wait → admin starts the show → torches/screens sync together
-→ everyone who joined is auto-entered into a giveaway, deduped per device →
-admin picks a random winner and messages that device directly.**
+Fan journey: **scan QR → open page, no app → grant camera permission when
+asked (that's the join action — no button tap needed) → wait → admin
+starts the show → torches/screens sync together → everyone who joined is
+auto-entered into a giveaway, deduped per device → admin picks a random
+winner and messages that device directly.**
 
 ## Why there's no seat map in here
 
@@ -81,10 +82,10 @@ Three pages, three tabs to test with:
 
 ## Test with a real phone
 
-`getUserMedia` (needed to control the real camera torch on Android Chrome)
-only works in a "secure context" — HTTPS, or `localhost` itself. Your phone
-is not `localhost`, so for a real test you need a public HTTPS URL. Easiest
-option:
+`getUserMedia` (needed to control the real camera torch on Android and,
+as of iOS 17.5.1+, iOS too — see below) only works in a "secure context" —
+HTTPS, or `localhost` itself. Your phone is not `localhost`, so for a real
+test you need a public HTTPS URL. Easiest option:
 
 ```bash
 npx ngrok http 3000
@@ -92,12 +93,26 @@ npx ngrok http 3000
 
 Open `https://xxxx.ngrok-free.app/qr.html` on your laptop (or on a second
 screen) — it auto-generates the right QR code for that exact URL, no manual
-QR tool needed. Scan it with your phone. Tap
-"Enable my light", then trigger a cue from `/admin.html` on your laptop.
+QR tool needed. Scan it with your phone. Allow camera access when the
+browser asks — that's the join action, nothing else to tap — then trigger
+a cue from `/admin.html` on your laptop.
 
 - On **Android Chrome**, you should see the real camera LED flash.
-- On **iOS Safari**, there's no torch API — you'll see the screen flash
-  white/black instead. That's expected, not a bug (see explanation below).
+- On **iOS Safari, iOS 17.5.1 and later**, you should now ALSO see the real
+  camera LED flash. This used to be impossible — Safari had no web API for
+  torch control at all — but WebKit quietly added support for it around
+  mid-2024, confirmed by a WebKit engineer on the public bug tracker
+  (`bugs.webkit.org`, issue #243075), even though Apple never documented
+  or announced it. `public/index.html` requests it the same way on every
+  platform now (`getUserMedia` + `track.getCapabilities().torch`) rather
+  than hard-skipping iOS, so this should "just work" on any iPhone from
+  roughly the last two years. On an older iOS version, or if camera
+  permission is denied, it automatically falls back to the screen-flash
+  behavior below — same fallback as always, just no longer forced for
+  every iPhone regardless of actual capability.
+- If real torch control somehow isn't available (old iOS, permission
+  denied, no camera), you'll see the screen flash white/black instead.
+  That's the intended fallback, not a bug.
 
 ## How the sync actually works
 
@@ -135,9 +150,17 @@ on a VPS) so one person's typos don't lock out the actual admin too.
 
 ## Giveaway mechanics
 
-- **Entry**: happens on the explicit "Join the Light Show" tap, not just on
-  page load — loading the page and leaving without tapping Join does not
-  enter someone into the giveaway.
+- **Entry**: as of this version, entry happens automatically the moment
+  someone grants camera permission — the page requests it immediately on
+  load (`public/index.html`, `requestCameraPermission()`), and a granted
+  permission IS the join action, no separate tap required. If camera
+  access is denied or unavailable, a manual "Join the Light Show" button
+  appears as a fallback (screen-flash-only mode). This is a deliberate
+  trade-off from the original design, which required an explicit tap
+  specifically so that loading the page without intending to participate
+  didn't enter someone into the giveaway — that protection is gone now:
+  simply granting the permission prompt, even out of reflex, enters
+  someone. Worth knowing if you ever need that stricter guarantee back.
 - **De-dup key**: a random UUID generated client-side and persisted in
   `localStorage` (`public/index.html`, `getDeviceId()`). The server keys its
   giveaway pool (a `Map`) by this id, so re-joining (page refresh, network

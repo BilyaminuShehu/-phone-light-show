@@ -30,8 +30,8 @@
   <div id="flash"></div>
   <div id="ui">
     <h2>🔦 Light Show</h2>
-    <p class="sub">Tap join and hold your phone up — no app, no sign-up, just this page.</p>
-    <button id="joinBtn">Join the Light Show</button>
+    <p class="sub">Allow camera access when your phone asks — that's it, you're in. No app, no sign-up.</p>
+    <button id="joinBtn" style="display:none">Join the Light Show</button>
     <div id="status"><span class="dot off"></span>Connecting…</div>
   </div>
 
@@ -69,38 +69,94 @@ function getDeviceId() {
 }
 const deviceId = getDeviceId();
 
-// iOS Safari exposes no web API for the camera torch at all — skip the
-// camera permission prompt entirely on iOS and go straight to screen-flash.
-// This keeps the "as few steps as possible" requirement true for the
-// biggest platform where torch isn't an option anyway.
-const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
-  (navigator.userAgent.includes('Mac') && 'ontouchend' in document); // iPadOS reports as Mac
+// Historically iOS Safari exposed no web API for the camera torch at all,
+// so this used to hard-skip straight to screen-flash on iOS. That's no
+// longer accurate: WebKit quietly added torch support to getUserMedia
+// starting around iOS 17.5.1 (mid-2024) — confirmed directly by a WebKit
+// engineer on the public bug tracker (webkit.org/show_bug.cgi?id=243075),
+// even though Apple never announced it. The standard feature-detection
+// call (navigator.mediaDevices.getSupportedConstraints().torch) has its
+// own separate bug where it can wrongly report false even when torch
+// actually works (webkit.org/show_bug.cgi?id=270779) — so rather than
+// checking that flag, this just requests the camera and checks the real,
+// per-stream track.getCapabilities().torch after the fact, on every
+// platform. Very old iOS (pre-17.5.1, over two years old at this point)
+// or any browser without torch support simply falls through to the
+// screen-flash fallback below, same as it always did.
 
 let torchTrack = null;
 let offset = 0;
 let synced = false;
-let hasJoined = false; // becomes true only after the explicit Join tap
+let hasJoined = false; // becomes true once actually joined (auto via permission grant, or manual fallback tap)
 let showTimer = null; // interval handle for continuous show-start mode
 let ws;
 
+// --- auto-join-on-camera-permission flow ---
+// Requirement: scan QR -> browser opens -> immediately asks for camera
+// access -> granting it IS the join action, no separate button tap needed.
+// wsReadyAndSynced and cameraPermissionOutcome are set by two independent
+// async operations (the WebSocket connecting+clock-syncing, and the
+// getUserMedia permission prompt) that can finish in either order.
+// checkState() is the single place that reconciles them.
+let wsReadyAndSynced = false;
+let cameraPermissionOutcome = null; // null = still waiting, true = granted, false = denied/unavailable
+
 function setLight(on) {
   if (torchTrack) {
+    // Real torch is active — only drive the LED. Also flashing the whole
+    // screen white on top of that is redundant and, in a dark venue,
+    // actively unpleasant (blinding, and defeats the point of the LED
+    // being a small controlled light rather than the whole screen).
     torchTrack.applyConstraints({ advanced: [{ torch: on }] }).catch(() => {});
+  } else {
+    // No real torch available — screen flash is the only fallback.
+    flashEl.style.background = on ? '#ffffff' : '#000000';
   }
-  flashEl.style.background = on ? '#ffffff' : '#000000';
 }
 
-async function enableTorchIfPossible() {
-  if (isIOS) return false;
+async function requestCameraPermission() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (caps.torch) { torchTrack = track; return true; }
-    track.stop();
-    return false;
+    // Permission grant is the join signal regardless of whether this
+    // specific device actually has a controllable torch (e.g. a laptop's
+    // built-in webcam has no torch, but granting access still counts as
+    // "I'm in"). If there IS a torch, keep the track open to drive it;
+    // otherwise release the camera immediately, we don't need it.
+    if (caps.torch) { torchTrack = track; } else { track.stop(); }
+    cameraPermissionOutcome = true;
   } catch {
-    return false; // permission denied / no camera — screen flash still works
+    cameraPermissionOutcome = false; // denied, no camera, or insecure context — manual fallback below
+  }
+  checkState();
+}
+
+function doJoin() {
+  if (hasJoined) return; // guard against double-join from a race between the two async paths
+  hasJoined = true;
+  joinBtn.style.display = 'none';
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'join', deviceId }));
+  setStatus(torchTrack ? 'Flashlight enabled 🔦 — waiting for the show' : 'Screen-flash mode ready — waiting for the show', true);
+}
+
+function showManualJoinFallback() {
+  if (hasJoined) return;
+  joinBtn.textContent = 'Join the Light Show';
+  joinBtn.style.display = '';
+  setStatus('Camera access unavailable — tap the button to join in screen-flash mode', true);
+}
+
+function checkState() {
+  if (hasJoined) return;
+  if (cameraPermissionOutcome === true && wsReadyAndSynced) {
+    doJoin();
+  } else if (cameraPermissionOutcome === false) {
+    showManualJoinFallback();
+  } else if (!wsReadyAndSynced) {
+    setStatus('Connecting…', false);
+  } else {
+    setStatus('Waiting for camera permission — tap Allow when prompted', true);
   }
 }
 
@@ -166,16 +222,17 @@ function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
 
   ws.addEventListener('open', async () => {
-    setStatus(hasJoined ? 'Reconnected. Syncing…' : 'Connected.', false);
+    if (hasJoined) setStatus('Reconnected. Syncing…', false);
     await syncClock();
     if (hasJoined) {
       // Reconnect after a drop — rejoin automatically (same deviceId, so
-      // this can't create a second giveaway entry) so the show keeps working
-      // without another tap.
+      // this can't create a second giveaway entry) so the show keeps
+      // working without the person doing anything.
       ws.send(JSON.stringify({ type: 'join', deviceId }));
       setStatus('Ready — waiting for the show to start', true);
     } else {
-      setStatus('Tap the button to join', true);
+      wsReadyAndSynced = true;
+      checkState();
     }
   });
 
@@ -197,6 +254,7 @@ function connect() {
 
   ws.addEventListener('close', () => {
     synced = false;
+    wsReadyAndSynced = false;
     setStatus('Disconnected — reconnecting…', false);
     // Randomized delay (1000-2500ms) instead of a fixed 1500ms — if the
     // server restarts, every connected phone hitting reconnect at the
@@ -209,19 +267,9 @@ function connect() {
 }
 
 connect();
+requestCameraPermission(); // fires immediately on page load — granting it IS the join action
 
-joinBtn.addEventListener('click', async () => {
-  joinBtn.disabled = true;
-  joinBtn.textContent = 'Joining…';
-  hasJoined = true;
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'join', deviceId }));
-  const gotTorch = await enableTorchIfPossible();
-  joinBtn.textContent = "You're in ✓";
-  setStatus(
-    gotTorch ? 'Flashlight enabled 🔦 — waiting for the show' : 'Screen-flash mode ready — waiting for the show',
-    true
-  );
-});
+joinBtn.addEventListener('click', doJoin); // manual fallback, only ever shown if camera permission was denied/unavailable
 </script>
 </body>
 </html>
