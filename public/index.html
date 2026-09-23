@@ -24,29 +24,93 @@
   #winnerOverlay h1 { font-size:34px; margin:0 0 12px; }
   #winnerOverlay p { font-size:17px; max-width:320px; }
   #winnerOverlay button { margin-top:24px; background:#333; }
+  #winnerContactForm { margin-top:20px; display:flex; flex-direction:column; gap:10px; width:100%; max-width:300px; }
+  #winnerContactInput { font-size:16px; padding:13px; border-radius:10px; border:1px solid #444;
+    background:#1a1a1a; color:#eee; width:100%; box-sizing:border-box; }
+  #winnerContactForm button { margin-top:0; background:#e11d48; }
+  #winnerContactStatus { font-size:13px; opacity:0.75; margin-top:10px; max-width:300px; }
+
+  /* Show-active visual: a small animated equalizer-style wave, red/
+     blue/white, replacing the static "waiting" text so there's visible
+     feedback that the show is actually running (not just the flash
+     itself, which — especially in real-torch mode — leaves the screen
+     with nothing to look at otherwise). */
+  #showWave { display:none; align-items:flex-end; justify-content:center;
+    gap:5px; height:48px; margin-top:18px; }
+  #showWave .bar { width:7px; border-radius:4px 4px 0 0;
+    animation: wavebar 0.9s ease-in-out infinite; }
+  #showWave .bar:nth-child(1) { background:#e11d48; animation-delay:0s; }
+  #showWave .bar:nth-child(2) { background:#2563eb; animation-delay:0.12s; }
+  #showWave .bar:nth-child(3) { background:#f8fafc; animation-delay:0.24s; }
+  #showWave .bar:nth-child(4) { background:#2563eb; animation-delay:0.36s; }
+  #showWave .bar:nth-child(5) { background:#e11d48; animation-delay:0.48s; }
+  #showWave .bar:nth-child(6) { background:#f8fafc; animation-delay:0.6s; }
+  #showWave .bar:nth-child(7) { background:#e11d48; animation-delay:0.72s; }
+  @keyframes wavebar {
+    0%, 100% { height:10px; }
+    50% { height:46px; }
+  }
+  #liveLabel { display:none; font-size:14px; font-weight:700; letter-spacing:0.04em;
+    margin-top:10px; color:#f8fafc; }
 </style>
 </head>
 <body>
   <div id="flash"></div>
   <div id="ui">
     <h2>🔦 Light Show</h2>
-    <p class="sub">Allow camera access when your phone asks — that's it, you're in. No app, no sign-up.</p>
+    <p class="sub">Allow camera access when your phone asks — that's it, you're in. No app, no sign-up. Keep this tab open and your phone will stay awake on its own.</p>
     <button id="joinBtn" style="display:none">Join the Light Show</button>
     <div id="status"><span class="dot off"></span>Connecting…</div>
+    <div id="showWave" aria-hidden="true">
+      <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+      <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+    </div>
+    <div id="liveLabel">🎶 Show is live!</div>
   </div>
 
   <div id="winnerOverlay">
     <h1>🎉</h1>
     <p id="winnerText"></p>
+    <form id="winnerContactForm">
+      <input type="text" id="winnerContactInput" placeholder="Phone number or email, to claim your prize" autocomplete="off" />
+      <button type="submit">Submit</button>
+    </form>
+    <p id="winnerContactStatus"></p>
     <button id="winnerCloseBtn">Close</button>
   </div>
 
 <script>
 const statusEl = document.getElementById('status');
 const flashEl = document.getElementById('flash');
+const showWaveEl = document.getElementById('showWave');
+const liveLabelEl = document.getElementById('liveLabel');
 const joinBtn = document.getElementById('joinBtn');
 const winnerOverlay = document.getElementById('winnerOverlay');
 const winnerText = document.getElementById('winnerText');
+const winnerContactForm = document.getElementById('winnerContactForm');
+const winnerContactInput = document.getElementById('winnerContactInput');
+const winnerContactStatus = document.getElementById('winnerContactStatus');
+let currentWinnerId = null; // set when a 'winner' message arrives, sent back with the contact submission
+
+winnerContactForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const contact = winnerContactInput.value.trim();
+  if (!contact) return;
+  if (!currentWinnerId) {
+    winnerContactStatus.textContent = "Something went wrong — try closing and reopening this, or tell the fan desk directly.";
+    return;
+  }
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'winner-contact', winnerId: currentWinnerId, contact }));
+    winnerContactStatus.textContent = 'Sending…';
+  } else {
+    // Not connected right now (e.g. a brief drop) — the reconnect logic
+    // elsewhere in this file will restore the WebSocket on its own; the
+    // person just needs to hit Submit again once status updates.
+    winnerContactStatus.textContent = "Not connected right now — wait a moment and try Submit again.";
+  }
+});
+
 document.getElementById('winnerCloseBtn').addEventListener('click', () => {
   winnerOverlay.style.display = 'none';
 });
@@ -140,7 +204,7 @@ async function requestCameraPermission() {
     // built-in webcam has no torch, but granting access still counts as
     // "I'm in"). If there IS a torch, keep the track open to drive it;
     // otherwise release the camera immediately, we don't need it.
-    if (caps.torch) { torchTrack = track; } else { track.stop(); }
+    if (caps.torch) { torchTrack = track; hadTorchOnce = true; } else { track.stop(); }
     cameraPermissionOutcome = true;
   } catch {
     cameraPermissionOutcome = false; // denied, no camera, or insecure context — manual fallback below
@@ -148,11 +212,85 @@ async function requestCameraPermission() {
   checkState();
 }
 
+// Mobile browsers commonly KILL an open camera stream when the tab is
+// backgrounded or the phone screen locks — very likely at a real event,
+// where people's screens dim or they briefly switch apps. torchTrack
+// would then silently be dead (readyState 'ended'), and every future cue
+// would look like nothing happened even though the code thinks torch is
+// still available. This re-acquires it whenever we reconnect or the tab
+// becomes visible again — but ONLY for a device that actually had torch
+// working at least once; a device that's screen-flash-only from the
+// start has nothing to reacquire, and re-requesting the camera for it
+// on every reconnect would just be pointless, mildly intrusive noise.
+let hadTorchOnce = false;
+async function reacquireTorchIfNeeded() {
+  if (!hadTorchOnce) return;
+  if (torchTrack && torchTrack.readyState === 'live') return;
+  try {
+    const stream = await getRearCameraStream();
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.torch) { torchTrack = track; } else { track.stop(); }
+  } catch {
+    // Couldn't reacquire (permission revoked in the meantime, camera
+    // busy with another app, etc.) — setLight()'s existing torchTrack
+    // branch already handles a null torchTrack by using the screen-flash
+    // fallback, so nothing else needs to change here.
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    reacquireTorchIfNeeded();
+    requestWakeLock();
+    // Clear any visual/torch state left over from before the tab was
+    // backgrounded — if a cue was mid-flash when the screen locked, the
+    // browser can leave setLight(true)'s last state stuck (torch left
+    // on, or the screen frozen white) once things resume, since the
+    // scheduled setTimeout that would have turned it back off may have
+    // been throttled/dropped entirely while suspended. Coming back to a
+    // clean OFF state and waiting for the next live cue is the right
+    // recovery — there's no good way to "catch up" a missed cue after
+    // the fact without looking out of sync with everyone else in the
+    // room, so this doesn't attempt to.
+    setLight(false);
+  }
+});
+
+// Screen Wake Lock API: actively prevents the phone's screen from
+// auto-locking from inactivity while this page is open and visible —
+// directly addresses someone joining, then getting distracted, and their
+// phone timing out and locking before the show even starts. This does
+// NOT and CANNOT prevent someone deliberately pressing the lock button
+// or switching to another app — no website can override that on iOS or
+// Android, it's a deliberate OS-level protection, not a bug. Supported
+// on modern Chrome/Android and Safari/iOS 16.4+; silently does nothing
+// on older/unsupported browsers, which just fall back to normal
+// screen-timeout behavior as before.
+let wakeLockSentinel = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return; // unsupported — nothing to do
+  if (wakeLockSentinel && !wakeLockSentinel.released) return; // already held
+  try {
+    wakeLockSentinel = await navigator.wakeLock.request('screen');
+    wakeLockSentinel.addEventListener('release', () => {
+      // Fires when the OS reclaims it (tab backgrounded, screen
+      // deliberately locked, etc.) — re-acquired automatically by the
+      // visibilitychange handler above once the tab is visible again.
+      wakeLockSentinel = null;
+    });
+  } catch {
+    // Request can fail (e.g. low battery mode on some devices disables
+    // wake lock entirely) — falls back to normal screen-timeout
+    // behavior, same as an unsupported browser.
+  }
+}
+
 function doJoin() {
   if (hasJoined) return; // guard against double-join from a race between the two async paths
   hasJoined = true;
   joinBtn.style.display = 'none';
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'join', deviceId }));
+  requestWakeLock();
   setStatus(torchTrack ? 'Flashlight enabled 🔦 — waiting for the show' : 'Screen-flash mode ready — waiting for the show', true);
 }
 
@@ -208,17 +346,46 @@ function syncClock() {
   });
 }
 
+function showActiveVisual() {
+  statusEl.style.display = 'none';
+  showWaveEl.style.display = 'flex';
+  liveLabelEl.style.display = 'block';
+}
+
+function hideActiveVisual() {
+  showWaveEl.style.display = 'none';
+  liveLabelEl.style.display = 'none';
+  statusEl.style.display = 'block';
+}
+
+// Every setTimeout scheduled by runPattern() (used for one-off cues AND,
+// now, a full song-length generated light sequence — see the
+// 'song-cue' handling below) is tracked here so show-stop can actually
+// cancel them. Previously only the continuous-mode setInterval was
+// tracked; a long pattern's individual setTimeouts would keep firing
+// even after Stop was clicked, since nothing held onto their IDs.
+let scheduledLightTimeouts = [];
+
 function runPattern(pattern, startAt) {
+  if (!pattern.length) return;
+  const firstDelay = Math.max(0, startAt - offset - Date.now());
+  const lastStepT = Math.max(...pattern.map((s) => s.t));
+  const lastDelay = Math.max(0, (startAt + lastStepT) - offset - Date.now());
+
+  scheduledLightTimeouts.push(setTimeout(showActiveVisual, firstDelay));
+  scheduledLightTimeouts.push(setTimeout(hideActiveVisual, lastDelay + 300));
+
   pattern.forEach((step) => {
     const delay = Math.max(0, (startAt + step.t) - offset - Date.now());
-    setTimeout(() => setLight(step.on), delay);
+    scheduledLightTimeouts.push(setTimeout(() => setLight(step.on), delay));
   });
 }
 
 function startContinuousShow(startAt, mode, intervalMs) {
   stopContinuousShow();
   const localStart = Math.max(0, startAt - offset - Date.now());
-  setTimeout(() => {
+  scheduledLightTimeouts.push(setTimeout(() => {
+    showActiveVisual();
     if (mode === 'solid') {
       setLight(true);
     } else {
@@ -226,12 +393,15 @@ function startContinuousShow(startAt, mode, intervalMs) {
       setLight(true);
       showTimer = setInterval(() => { on = !on; setLight(on); }, intervalMs);
     }
-  }, localStart);
+  }, localStart));
 }
 
 function stopContinuousShow() {
   if (showTimer) { clearInterval(showTimer); showTimer = null; }
+  scheduledLightTimeouts.forEach((id) => clearTimeout(id));
+  scheduledLightTimeouts = [];
   setLight(false);
+  hideActiveVisual();
 }
 
 function connect() {
@@ -243,7 +413,11 @@ function connect() {
     if (hasJoined) {
       // Reconnect after a drop — rejoin automatically (same deviceId, so
       // this can't create a second giveaway entry) so the show keeps
-      // working without the person doing anything.
+      // working without the person doing anything. Also re-verify torch
+      // access in case it died while backgrounded (see
+      // reacquireTorchIfNeeded's comment above) — fire-and-forget, this
+      // shouldn't delay the rejoin itself.
+      reacquireTorchIfNeeded();
       ws.send(JSON.stringify({ type: 'join', deviceId }));
       setStatus('Ready — waiting for the show to start', true);
     } else {
@@ -259,12 +433,26 @@ function connect() {
     if (msg.type === 'show-stop') stopContinuousShow();
     if (msg.type === 'winner') {
       winnerText.textContent = msg.message;
+      currentWinnerId = msg.winnerId || null;
+      // Reset the contact form each time — covers the (rare) case of
+      // winning more than once in the same tab session across a
+      // giveaway-eligibility reset.
+      winnerContactForm.style.display = currentWinnerId ? 'flex' : 'none';
+      winnerContactInput.value = '';
+      winnerContactStatus.textContent = '';
       winnerOverlay.style.display = 'flex';
       // A fan holding their phone up for the light show may not be
       // looking at the screen the instant they win — a vibration pattern
       // gets their attention. Silently does nothing on iOS Safari / any
       // browser without the Vibration API, so this is purely additive.
       try { if (navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 400]); } catch {}
+    }
+    if (msg.type === 'winner-contact-ok') {
+      winnerContactStatus.textContent = "✅ Thanks — we've got your info.";
+      winnerContactForm.style.display = 'none';
+    }
+    if (msg.type === 'winner-contact-error') {
+      winnerContactStatus.textContent = `⚠ ${msg.error}`;
     }
   });
 

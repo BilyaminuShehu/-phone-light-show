@@ -80,6 +80,36 @@ Three pages, three tabs to test with:
   or, on a paid Render plan with zero-downtime deploys, for Render itself
   to confirm the new instance is ready before killing the old one.
 
+## Keeping the screen awake
+
+`public/index.html` requests a Screen Wake Lock (`navigator.wakeLock`,
+standard on modern Chrome/Android and Safari/iOS 16.4+) the moment someone
+joins, and re-requests it whenever the tab regains focus. This stops a
+joined fan's phone from auto-locking from simple inactivity — someone
+scans in, gets distracted for a minute before the show starts, and their
+screen doesn't time out and lock on its own.
+
+**What this does NOT and cannot do**: override someone deliberately
+pressing the lock button, or switching to another app. No website can do
+that on iOS or Android — it's a deliberate OS-level protection, not a
+missing feature here. When a screen is genuinely locked (not just
+auto-timed-out), the browser suspends JavaScript execution in that tab
+almost immediately, which is exactly why the native-app competitors
+mentioned earlier in this README require an actual app install: only a
+real installed app gets the background-execution permissions needed to
+keep running through a locked screen. This project stays a
+scan-and-go website on purpose, so that constraint stays in place too —
+see "How are other companies doing it" in this project's history for the
+full trade-off.
+
+What IS handled: when a phone's screen does lock (deliberately, or the
+wake lock request failed/was unsupported) and the person later unlocks
+it, `visibilitychange` fires reacquireTorchIfNeeded() (torch access can
+die while backgrounded) and forces the light off via `setLight(false)` —
+so they come back to a clean, correctly-off state and pick up the next
+live cue, rather than a stuck-on torch or a frozen white screen left over
+from whatever was mid-flash when the screen locked.
+
 ## Test with a real phone
 
 `getUserMedia` (needed to control the real camera torch on Android and,

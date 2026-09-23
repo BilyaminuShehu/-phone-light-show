@@ -77,8 +77,9 @@
   </p>
   <input type="file" id="audioFile" accept="audio/*" />
   <audio id="player" controls style="width:100%; margin:10px 0;"></audio>
+  <p id="analysisStatus" class="warn"></p>
   <div>
-    <button class="secondary" onclick="tapTempo()">👆 Tap tempo</button>
+    <button class="secondary" onclick="tapTempo()">👆 Tap tempo (manual override)</button>
     <input type="text" id="bpmInput" value="120" style="width:70px; text-align:center;" /> BPM
     <label style="font-size:13px; margin-left:8px;">
       <input type="checkbox" id="halfTime" /> half-time (for fast songs)
@@ -205,6 +206,7 @@ function connectWS() {
     if (msg.type === 'giveaway-reset-ok') log('Winner eligibility reset — connected phones stay joined.');
     if (msg.type === 'disconnect-all-ok') log(`Disconnected ${msg.count} phone(s) — they'll reconnect and rejoin automatically within a couple seconds.`);
     if (msg.type === 'winner-history') renderWinnerHistory(msg.history);
+    if (msg.type === 'song-cue-error') log(`⚠ ${msg.error}`);
   });
   ws.addEventListener('close', () => setTimeout(connectWS, 1000 + Math.random() * 1500)); // jittered — see public/index.html for why
 }
@@ -245,15 +247,149 @@ function showStop() {
 }
 
 // --- Sync to a song ---
-document.getElementById('audioFile').addEventListener('change', (e) => {
+// generatedPattern/generatedBpm hold the result of real audio analysis
+// (see analyzeSongForBeats below) — when present, playAndSync() sends
+// the actual rhythm-following pattern instead of the old constant-
+// interval pulse. Manual BPM / tap-tempo stays available as an explicit
+// override (the "👆 Tap tempo (manual override)" button below) for songs
+// where the automatic analysis doesn't land well, or if you just prefer
+// a steady pulse over the detected rhythm.
+let generatedPattern = null;
+let generatedBpm = null;
+let generatedDurationMs = null;
+
+document.getElementById('audioFile').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   document.getElementById('player').src = URL.createObjectURL(file);
+  generatedPattern = null; generatedBpm = null; generatedDurationMs = null;
   log(`Loaded song: ${file.name}`);
+
+  const statusEl = document.getElementById('analysisStatus');
+  statusEl.textContent = '🎧 Analyzing song\'s rhythm — this runs once, in your browser, before you start the show...';
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await analyzeSongForBeats(arrayBuffer);
+    generatedPattern = result.pattern;
+    generatedBpm = result.bpm;
+    generatedDurationMs = result.durationMs;
+    document.getElementById('bpmInput').value = result.bpm || document.getElementById('bpmInput').value;
+    statusEl.textContent = `✅ Analysis complete — detected ~${result.bpm || '?'} BPM, ${result.onsetCount} rhythm hits over ${(result.durationMs / 1000).toFixed(1)}s. "Play song + start lights" will follow the actual rhythm.`;
+    log(`Song analysis complete: ~${result.bpm || '?'} BPM, ${result.onsetCount} detected hits.`);
+  } catch (err) {
+    generatedPattern = null;
+    statusEl.textContent = `⚠ Automatic analysis failed (${err.message}) — falling back to manual BPM / tap-tempo below.`;
+    log(`Song analysis failed: ${err.message} — use manual BPM instead.`);
+  }
 });
+
+// Real energy-based onset detection: decodes the song, runs it through a
+// bass-focused lowpass filter (most pop/dance rhythm is carried by the
+// kick drum / bassline, not hi-hats or vocals), computes a short-time
+// energy envelope, and picks peaks in the energy's rate-of-increase
+// ("flux") as rhythmic hits — a standard, well-documented DSP technique
+// for simple onset/beat detection, not a lookup table or a guess. This
+// runs once per uploaded song, entirely in the browser (nothing is
+// uploaded anywhere), and its output is a genuine {t, on} light pattern
+// that follows THIS song's actual hits, not a generic constant pulse.
+//
+// Known limits, stated plainly: this is a heuristic signal-processing
+// detector, not a trained ML beat-tracker — it does best on tracks with
+// a clear, percussive low end (four-on-the-floor dance/pop, most of
+// what a crowd light show gets used for) and can be less precise on
+// music without a strong rhythmic low end (sparse ballads, heavily
+// syncopated or genre-atypical tracks). The minimum 340ms gap between
+// detected hits is a deliberate safety floor — it keeps the generated
+// pattern under the ~3Hz flash-rate threshold used elsewhere in this
+// project (see README, "Strobe/flash safety") even for very dense or
+// fast material.
+async function analyzeSongForBeats(arrayBuffer) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error('Web Audio API not supported in this browser');
+  const audioCtx = new AudioContextClass();
+  let audioBuffer;
+  try {
+    audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+  } finally {
+    audioCtx.close();
+  }
+
+  const sampleRate = audioBuffer.sampleRate;
+  const duration = audioBuffer.duration;
+  if (!(duration > 0)) throw new Error('empty or unreadable audio');
+
+  const offlineCtx = new OfflineAudioContext(1, Math.ceil(duration * sampleRate), sampleRate);
+  const source = offlineCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  const lowpass = offlineCtx.createBiquadFilter();
+  lowpass.type = 'lowpass';
+  lowpass.frequency.value = 150; // Hz — bass/kick range
+  source.connect(lowpass);
+  lowpass.connect(offlineCtx.destination);
+  source.start(0);
+  const filtered = await offlineCtx.startRendering();
+  const data = filtered.getChannelData(0);
+
+  const FRAME_SEC = 0.02; // 20ms frames
+  const frameSize = Math.max(1, Math.round(sampleRate * FRAME_SEC));
+  const frameCount = Math.floor(data.length / frameSize);
+  if (frameCount < 10) throw new Error('song too short to analyze');
+
+  const energy = new Float32Array(frameCount);
+  for (let i = 0; i < frameCount; i++) {
+    let sum = 0;
+    const start = i * frameSize;
+    for (let j = 0; j < frameSize; j++) { const v = data[start + j]; sum += v * v; }
+    energy[i] = Math.sqrt(sum / frameSize);
+  }
+
+  const flux = new Float32Array(frameCount);
+  for (let i = 1; i < frameCount; i++) flux[i] = Math.max(0, energy[i] - energy[i - 1]);
+
+  const MIN_GAP_SEC = 0.34; // safety floor — see function comment above
+  const minGapFrames = Math.round(MIN_GAP_SEC / FRAME_SEC);
+  const windowFrames = Math.round(1.0 / FRAME_SEC); // ~1s local window for the adaptive threshold
+
+  const onsetFrames = [];
+  let lastOnsetFrame = -Infinity;
+  for (let i = 1; i < frameCount - 1; i++) {
+    const winStart = Math.max(0, i - windowFrames);
+    let sum = 0;
+    for (let k = winStart; k < i; k++) sum += flux[k];
+    const localMean = sum / Math.max(1, i - winStart);
+    const threshold = localMean * 1.5 + 0.0008;
+    const isLocalPeak = flux[i] >= flux[i - 1] && flux[i] >= flux[i + 1];
+    if (flux[i] > threshold && isLocalPeak && (i - lastOnsetFrame) >= minGapFrames) {
+      onsetFrames.push(i);
+      lastOnsetFrame = i;
+    }
+  }
+
+  const onsetTimesMs = onsetFrames.map((i) => Math.round((i * frameSize / sampleRate) * 1000));
+
+  let bpm = null;
+  if (onsetTimesMs.length > 4) {
+    const intervals = [];
+    for (let i = 1; i < onsetTimesMs.length; i++) intervals.push(onsetTimesMs[i] - onsetTimesMs[i - 1]);
+    intervals.sort((a, b) => a - b);
+    const median = intervals[Math.floor(intervals.length / 2)];
+    if (median > 0) bpm = Math.round(60000 / median);
+  }
+
+  const FLASH_ON_MS = 90;
+  const pattern = [];
+  for (const t of onsetTimesMs) {
+    pattern.push({ t, on: true });
+    pattern.push({ t: t + FLASH_ON_MS, on: false });
+  }
+
+  return { pattern, bpm, onsetCount: onsetTimesMs.length, durationMs: Math.round(duration * 1000) };
+}
 
 let tapTimes = [];
 function tapTempo() {
+  generatedPattern = null; // explicit manual override — stop using the analyzed rhythm
+  document.getElementById('analysisStatus').textContent = 'Manual tap-tempo active — automatic rhythm analysis is not being used for this show.';
   const now = Date.now();
   if (tapTimes.length && now - tapTimes[tapTimes.length - 1] > 2000) tapTimes = []; // idle reset
   tapTimes.push(now);
@@ -293,9 +429,15 @@ function playAndSync() {
   player.currentTime = 0;
   player.play().then(() => player.pause()).catch(() => {});
 
+  if (generatedPattern && generatedPattern.length) {
+    if (!sendToServer({ type: 'song-cue', pattern: generatedPattern })) return;
+    log(`Requested rhythm-following show (${generatedPattern.length / 2} hits, ~${generatedBpm || '?'} BPM) — waiting for server timing...`);
+    return;
+  }
+
   const intervalMs = bpmToIntervalMs();
   if (!sendToServer({ type: 'show-start', mode: 'pulse', intervalMs })) return;
-  log(`Requested sync start at ${intervalMs}ms/beat — waiting for server timing...`);
+  log(`Requested constant-pulse sync at ${intervalMs}ms/beat (no analyzed rhythm available) — waiting for server timing...`);
 }
 
 function stopSong() {
@@ -313,17 +455,23 @@ function renderWinnerHistory(history) {
   el.innerHTML = ''; // clear, then build with textContent per row — avoids injecting the admin-entered message as raw HTML
   latestWinnerHistory.slice().reverse().forEach((h) => {
     const row = document.createElement('div');
-    row.textContent = `${new Date(h.timestamp).toLocaleString()} — device ${h.shortId} — ${h.online ? 'delivered live' : 'queued (was offline)'} — "${h.message}"`;
+    const contactPart = h.contact ? ` — contact: ${h.contact}` : ' — contact: (not submitted yet)';
+    row.textContent = `${new Date(h.timestamp).toLocaleString()} — device ${h.shortId} — ${h.online ? 'delivered live' : 'queued (was offline)'} — "${h.message}"${contactPart}`;
     el.appendChild(row);
   });
 }
 
 function exportWinnerHistory() {
   if (!latestWinnerHistory.length) { log('No winner history to export yet.'); return; }
+  // Contains real people's contact info once submitted — treat the
+  // downloaded file the same as any other list with personal data
+  // (don't commit it to a public repo, don't share it more widely than
+  // whoever's actually handling prize fulfillment needs).
   const text = latestWinnerHistory
-    .map(h => `${new Date(h.timestamp).toISOString()}\t${h.shortId}\t${h.online ? 'delivered' : 'queued'}\t${h.message}`)
+    .map(h => `${new Date(h.timestamp).toISOString()}\t${h.shortId}\t${h.online ? 'delivered' : 'queued'}\t${h.message}\t${h.contact || ''}`)
     .join('\n');
-  const blob = new Blob([text], { type: 'text/plain' });
+  const header = 'timestamp\tdevice\tstatus\tmessage\tcontact\n';
+  const blob = new Blob([header + text], { type: 'text/plain' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `winner-history-${Date.now()}.txt`;
