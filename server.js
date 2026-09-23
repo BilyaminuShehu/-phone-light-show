@@ -150,7 +150,14 @@ function gracefulShutdown(signal) {
     for (const [deviceId, entry] of pool.entries()) {
       poolOut[deviceId] = { connectedAt: entry.connectedAt, hasWon: entry.hasWon, pendingWinMessage: entry.pendingWinMessage };
     }
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ pool: poolOut, winnerHistory }));
+    const tmp = STATE_FILE + '.tmp';
+    // Same atomic tmp-file + rename pattern as flushState() — a plain
+    // direct write here could leave a truncated/corrupted state file if
+    // the process is killed (e.g. SIGKILL after the SIGTERM grace period
+    // expires) mid-write, which loadState() would then have to silently
+    // discard on the next boot.
+    fs.writeFileSync(tmp, JSON.stringify({ pool: poolOut, winnerHistory }));
+    fs.renameSync(tmp, STATE_FILE);
   } catch (err) {
     console.warn(`[state] failed to save on shutdown: ${err.message}`);
   }
@@ -401,6 +408,32 @@ wss.on('connection', (ws, req) => {
       console.log('[admin] giveaway pool reset (eligibility only — connected devices stay in the pool and keep receiving cues)');
       markStateDirty();
       flushState(); // same — flush immediately rather than waiting up to 2s
+      return;
+    }
+
+    if (msg.type === 'disconnect-all') {
+      // Force-closes every connected participant socket. This is
+      // DIFFERENT from reset-giveaway: it doesn't touch anyone's
+      // giveaway eligibility or entry, it just kicks the live
+      // connection. Each phone's own client-side reconnect logic (see
+      // public/index.html, the ws 'close' handler) picks this up within
+      // 1-2.5s (jittered) and automatically reconnects + rejoins with
+      // the same deviceId — no giveaway impact, and the person doesn't
+      // need to rescan the QR code or grant camera permission again,
+      // since that's all still held in their open browser tab. Useful
+      // for clearing out stale/ghost connections before a real show,
+      // or forcing everyone onto a fresh socket.
+      let count = 0;
+      for (const entry of pool.values()) {
+        if (entry.ws && entry.ws.readyState === 1) {
+          entry.ws.close();
+          count++;
+        }
+      }
+      // Each closed socket's own 'close' handler already calls
+      // broadcastStats(), so no need to call it again here.
+      send(ws, { type: 'disconnect-all-ok', count });
+      console.log(`[admin] force-disconnected ${count} connected phone(s) — they'll auto-reconnect within a couple seconds`);
       return;
     }
   });

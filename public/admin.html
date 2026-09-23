@@ -42,6 +42,8 @@
     <div class="stat"><div class="n" id="connectedN">0</div><div class="l">connected now</div></div>
     <div class="stat"><div class="n" id="entriesN">0</div><div class="l">giveaway entries</div></div>
   </div>
+  <button class="secondary" onclick="disconnectAll()">Disconnect everyone (force reconnect)</button>
+  <p class="warn">Kicks every connected phone's current connection — they auto-reconnect and rejoin within a couple seconds, no rescanning needed. Doesn't touch the giveaway.</p>
 
   <h2>Show control</h2>
   <div>
@@ -115,6 +117,24 @@ function log(line) {
   el.scrollTop = el.scrollHeight;
 }
 
+// Every admin action button routes through this instead of calling
+// ws.send() directly. The panel stays visible during a brief reconnect
+// (see the ws 'close' handler below — deliberately doesn't hide the
+// panel, so the UI doesn't flash back to the login gate on a normal
+// blip), which means it's possible to click a button in the narrow
+// window where ws is reconnecting but not yet OPEN. Calling ws.send()
+// directly in that state throws an uncaught InvalidStateError — the
+// click silently does nothing with zero feedback. This guards every
+// send with a real check and a visible log line instead.
+function sendToServer(obj) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+  log('⚠ Not connected to the server right now — try again in a moment.');
+  return false;
+}
+
 // Same clock-sync trick the phones use (see public/index.html) — lets the
 // admin schedule local audio.play() against the exact instant the phones
 // will start flashing, instead of the two drifting apart.
@@ -183,6 +203,7 @@ function connectWS() {
       }
     }
     if (msg.type === 'giveaway-reset-ok') log('Winner eligibility reset — connected phones stay joined.');
+    if (msg.type === 'disconnect-all-ok') log(`Disconnected ${msg.count} phone(s) — they'll reconnect and rejoin automatically within a couple seconds.`);
     if (msg.type === 'winner-history') renderWinnerHistory(msg.history);
   });
   ws.addEventListener('close', () => setTimeout(connectWS, 1000 + Math.random() * 1500)); // jittered — see public/index.html for why
@@ -207,18 +228,18 @@ function warnIfNobodyConnected() {
 
 function trigger(pattern) {
   warnIfNobodyConnected();
-  ws.send(JSON.stringify({ type: 'trigger', pattern }));
+  if (!sendToServer({ type: 'trigger', pattern })) return;
   log(`Triggered: ${pattern} — fires on ${CONNECTED_N()} phone(s) in ~2.5s (not on this admin screen)`);
 }
 function showStart() {
   warnIfNobodyConnected();
   const mode = document.getElementById('modeSelect').value;
   const intervalMs = Number(document.getElementById('speedSelect').value);
-  ws.send(JSON.stringify({ type: 'show-start', mode, intervalMs }));
+  if (!sendToServer({ type: 'show-start', mode, intervalMs })) return;
   log(`Show started: mode=${mode} interval=${intervalMs}ms — starts on ${CONNECTED_N()} phone(s) in ~2.5s`);
 }
 function showStop() {
-  ws.send(JSON.stringify({ type: 'show-stop' }));
+  if (!sendToServer({ type: 'show-stop' })) return;
   document.getElementById('player').pause();
   log('Show stopped.');
 }
@@ -273,7 +294,7 @@ function playAndSync() {
   player.play().then(() => player.pause()).catch(() => {});
 
   const intervalMs = bpmToIntervalMs();
-  ws.send(JSON.stringify({ type: 'show-start', mode: 'pulse', intervalMs }));
+  if (!sendToServer({ type: 'show-start', mode: 'pulse', intervalMs })) return;
   log(`Requested sync start at ${intervalMs}ms/beat — waiting for server timing...`);
 }
 
@@ -282,7 +303,7 @@ function stopSong() {
 }
 function pickWinner() {
   const message = document.getElementById('winMsg').value;
-  ws.send(JSON.stringify({ type: 'pick-winner', message }));
+  sendToServer({ type: 'pick-winner', message });
 }
 let latestWinnerHistory = [];
 function renderWinnerHistory(history) {
@@ -312,7 +333,14 @@ function exportWinnerHistory() {
 
 function resetGiveaway() {
   if (!confirm('Make everyone eligible to win again? Currently-connected phones stay joined and keep receiving cues — this only clears past-winner status, it does not disconnect anyone or wipe the connected count. This cannot be undone.')) return;
-  ws.send(JSON.stringify({ type: 'reset-giveaway' }));
+  sendToServer({ type: 'reset-giveaway' });
+}
+
+function disconnectAll() {
+  const n = CONNECTED_N();
+  if (n === 0) { log('No phones currently connected — nothing to disconnect.'); return; }
+  if (!confirm(`Force-disconnect all ${n} connected phone(s)? They'll automatically reconnect and rejoin within a couple seconds — no giveaway entries are affected, and nobody needs to rescan the QR code.`)) return;
+  sendToServer({ type: 'disconnect-all' });
 }
 </script>
 </body>

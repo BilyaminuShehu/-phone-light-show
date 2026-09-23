@@ -114,9 +114,25 @@ function setLight(on) {
   }
 }
 
+async function getRearCameraStream() {
+  // facingMode: 'ideal' is only a PREFERENCE — some Android browsers will
+  // still hand back the front camera (which never has a torch) if that's
+  // what was last used or easiest to grab, silently causing the
+  // screen-flash fallback to kick in even on a device that has a real
+  // torch. 'exact' forces the real back/environment camera or fails
+  // outright (OverconstrainedError) rather than silently substituting —
+  // so try exact first, and only fall back to 'ideal' if this device
+  // genuinely can't satisfy it (e.g. a single-camera device).
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video: { facingMode: { exact: 'environment' } } });
+  } catch {
+    return await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+  }
+}
+
 async function requestCameraPermission() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+    const stream = await getRearCameraStream();
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : {};
     // Permission grant is the join signal regardless of whether this
