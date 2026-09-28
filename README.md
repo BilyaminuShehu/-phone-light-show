@@ -83,11 +83,15 @@ Three pages, three tabs to test with:
 ## Keeping the screen awake
 
 `public/index.html` requests a Screen Wake Lock (`navigator.wakeLock`,
-standard on modern Chrome/Android and Safari/iOS 16.4+) the moment someone
-joins, and re-requests it whenever the tab regains focus. This stops a
-joined fan's phone from auto-locking from simple inactivity — someone
-scans in, gets distracted for a minute before the show starts, and their
-screen doesn't time out and lock on its own.
+supported on Chrome/Android since 2020, desktop Safari since 16.4/2023,
+and — notably later — Safari on iOS only since iOS 18.4/March 2025) the
+moment someone joins, and re-requests it whenever the tab regains focus.
+This stops a joined fan's phone from auto-locking from simple inactivity
+— someone scans in, gets distracted for a minute before the show starts,
+and their screen doesn't time out and lock on its own. On an iPhone
+running an older iOS, the feature-detect (`'wakeLock' in navigator`)
+correctly finds it unsupported and silently skips it — no crash, just no
+wake-lock benefit on that specific device.
 
 **What this does NOT and cannot do**: override someone deliberately
 pressing the lock button, or switching to another app. No website can do

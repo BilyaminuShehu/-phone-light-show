@@ -428,6 +428,18 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (msg.type === 'show-pause') {
+      // A genuine mid-song pause — DIFFERENT from show-stop: participants
+      // stop the flash but keep the wave visual visible (just frozen, see
+      // public/index.html), and no thank-you popup fires. Viewer status
+      // stays "live" since the show isn't actually over, just paused.
+      // No startAt/lead-time here — pausing should feel instant, not
+      // delayed like starting a new synced pattern needs to be.
+      broadcastToParticipants({ type: 'show-pause' });
+      console.log('[admin] show-pause');
+      return;
+    }
+
     if (msg.type === 'pick-winner') {
       const eligible = [...pool.entries()].filter(([, e]) => !e.hasWon);
       if (eligible.length === 0) {

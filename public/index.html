@@ -24,6 +24,29 @@
   #winnerOverlay h1 { font-size:34px; margin:0 0 12px; }
   #winnerOverlay p { font-size:17px; max-width:320px; }
   #winnerOverlay button { margin-top:24px; background:#333; }
+  /* Separate from #winnerOverlay on purpose — a winner win is always
+     the priority message; this only ever shows when that one ISN'T
+     already up (see the JS below), so the two never compete for the
+     same screen. */
+  #thankYouOverlay { position:fixed; inset:0; z-index:9; background:rgba(0,0,0,0.92);
+    display:none; align-items:center; justify-content:center; flex-direction:column; text-align:center; padding:24px;
+    overflow:hidden; }
+  #thankYouOverlay h1 { font-size:32px; margin:0 0 12px; position:relative; z-index:1; }
+  #thankYouOverlay p { font-size:16px; max-width:320px; opacity:0.9; position:relative; z-index:1; }
+  #thankYouOverlay button { margin-top:24px; background:#333; font-size:15px; padding:10px 24px; position:relative; z-index:1; }
+  /* "Gravity" confetti — small colored pieces spawned at the top the
+     instant the popup appears, falling with an accelerating (ease-in-
+     like) curve to approximate real gravity, tumbling as they fall.
+     Spawned fresh in JS each time (see spawnConfetti below) rather than
+     sitting in the page permanently, and removed once their animation
+     finishes so repeated show/stop cycles don't pile up stale nodes. */
+  .confetti-piece { position:absolute; top:-24px; width:8px; height:14px; border-radius:2px;
+    animation-name:confettiFall; animation-timing-function:cubic-bezier(0.55,0.06,0.68,0.19);
+    animation-fill-mode:forwards; pointer-events:none; }
+  @keyframes confettiFall {
+    0% { transform:translateY(0) rotate(0deg); opacity:1; }
+    100% { transform:translateY(115vh) rotate(600deg); opacity:0.4; }
+  }
   #winnerContactForm { margin-top:20px; display:flex; flex-direction:column; gap:10px; width:100%; max-width:300px; }
   #winnerContactInput { font-size:16px; padding:13px; border-radius:10px; border:1px solid #444;
     background:#1a1a1a; color:#eee; width:100%; box-sizing:border-box; }
@@ -35,37 +58,38 @@
      feedback that the show is actually running (not just the flash
      itself, which — especially in real-torch mode — leaves the screen
      with nothing to look at otherwise). */
-  #showWave { display:none; align-items:flex-end; justify-content:center;
-    gap:5px; height:48px; margin-top:18px; }
-  #showWave .bar { width:7px; border-radius:4px 4px 0 0;
-    animation: wavebar 0.9s ease-in-out infinite; }
-  #showWave .bar:nth-child(1) { background:#e11d48; animation-delay:0s; }
-  #showWave .bar:nth-child(2) { background:#2563eb; animation-delay:0.12s; }
-  #showWave .bar:nth-child(3) { background:#f8fafc; animation-delay:0.24s; }
-  #showWave .bar:nth-child(4) { background:#2563eb; animation-delay:0.36s; }
-  #showWave .bar:nth-child(5) { background:#e11d48; animation-delay:0.48s; }
-  #showWave .bar:nth-child(6) { background:#f8fafc; animation-delay:0.6s; }
-  #showWave .bar:nth-child(7) { background:#e11d48; animation-delay:0.72s; }
-  @keyframes wavebar {
-    0%, 100% { height:10px; }
-    50% { height:46px; }
+  #liveLabel { display:none; font-size:15px; font-weight:700; letter-spacing:0.04em;
+    position:relative; z-index:2; color:#f8fafc; text-shadow:0 0 8px rgba(0,0,0,0.8); }
+  /* Full-screen flowing wave — several smooth, glowing SVG lines in
+     red/blue/white, each independently scrolling horizontally (seamless
+     loop, no jump), stacked at different vertical offsets/speeds for a
+     layered, organic look — replacing the earlier bar-spectrum version
+     with something closer to a real audio-waveform visual. Paths are
+     generated once in JS (see buildFullWaveLines below) rather than
+     hand-drawn, since a smooth sine-like curve needs many points. */
+  #fullWave { position:fixed; inset:0; z-index:1; display:none; overflow:hidden; background:#000; }
+  #fullWave svg { position:absolute; top:0; left:0; width:200%; height:100%; }
+  @keyframes waveScroll { from { transform:translateX(0); } to { transform:translateX(-50%); } }
+  .wave-burst { position:absolute; width:50px; height:50px; border-radius:50%;
+    background:radial-gradient(circle, currentColor 0%, transparent 70%);
+    animation-name:burstPulse; animation-timing-function:ease-out; animation-iteration-count:infinite;
+    pointer-events:none; }
+  @keyframes burstPulse {
+    0% { transform:scale(0.2); opacity:0; }
+    30% { opacity:0.85; }
+    100% { transform:scale(2.4); opacity:0; }
   }
-  #liveLabel { display:none; font-size:14px; font-weight:700; letter-spacing:0.04em;
-    margin-top:10px; color:#f8fafc; }
 </style>
 </head>
 <body>
   <div id="flash"></div>
+  <div id="fullWave" aria-hidden="true"></div>
   <div id="ui">
-    <h2>🔦 Light Show</h2>
-    <p class="sub">Allow camera access when your phone asks — that's it, you're in. No app, no sign-up. Keep this tab open and your phone will stay awake on its own.</p>
+    <h2 id="joinHeading">📱 Telefonunuzu Açık Tutun</h2>
+    <p class="sub" id="joinSub">Işık şovu sırasında bağlantınızın kesilmemesi için lütfen telefonunuzu kilitlemeyin veya bu sayfadan ayrılmayın.</p>
     <button id="joinBtn" style="display:none">Join the Light Show</button>
     <div id="status"><span class="dot off"></span>Connecting…</div>
-    <div id="showWave" aria-hidden="true">
-      <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
-      <div class="bar"></div><div class="bar"></div><div class="bar"></div>
-    </div>
-    <div id="liveLabel">🎶 Show is live!</div>
+    <div id="liveLabel">Şov Başladı!</div>
   </div>
 
   <div id="winnerOverlay">
@@ -79,11 +103,91 @@
     <button id="winnerCloseBtn">Close</button>
   </div>
 
+  <div id="thankYouOverlay">
+    <h1>🙏</h1>
+    <p>Işık şovuna katıldığınız için teşekkür ederiz!</p>
+    <button id="thankYouCloseBtn">Kapat</button>
+  </div>
+
 <script>
 const statusEl = document.getElementById('status');
 const flashEl = document.getElementById('flash');
-const showWaveEl = document.getElementById('showWave');
 const liveLabelEl = document.getElementById('liveLabel');
+const fullWaveEl = document.getElementById('fullWave');
+
+// Generates a smooth, seamlessly-looping wavy SVG path: drawn once over
+// `width` units at `waves` full sine cycles (an integer, so the path's
+// start and end line up perfectly), then that same shape is duplicated
+// once more immediately after itself — the two copies laid end to end
+// LOOK identical at the seam, so animating exactly one copy-width to the
+// left (via CSS transform, see waveScroll) loops forever with no visible
+// jump or reset.
+function buildSeamlessWavePath(width, amplitude, waves, baselineY, phase) {
+  const steps = 80;
+  const single = [];
+  for (let i = 0; i <= steps; i++) {
+    const x = (i / steps) * width;
+    const y = baselineY + Math.sin((i / steps) * Math.PI * 2 * waves + phase) * amplitude;
+    single.push([x, y]);
+  }
+  const all = [...single, ...single.map(([x, y]) => [x + width, y])];
+  return all.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+}
+
+// Three layered wavy lines — red/yellow/white, each its own amplitude,
+// frequency, vertical position, glow, and scroll speed (one running in
+// reverse) for a rich, organic "moving wave" look. Bigger amplitude and
+// closer baselines than the first version so the lines actually cross
+// through each other as they scroll, plus a stronger glow for a more
+// vivid, "explosive" feel rather than a flat, static-looking line.
+function buildFullWaveLines() {
+  const svgns = 'http://www.w3.org/2000/svg';
+  const layers = [
+    { color: '#e11d48', amplitude: 22, waves: 3, baselineY: 42, duration: '5s', opacity: 0.9, strokeWidth: 1.4, reverse: false, glow: 5 },
+    { color: '#facc15', amplitude: 26, waves: 2, baselineY: 50, duration: '7s', opacity: 0.85, strokeWidth: 1.4, reverse: true, glow: 6 },
+    { color: '#f8fafc', amplitude: 18, waves: 4, baselineY: 58, duration: '9s', opacity: 0.4, strokeWidth: 1, reverse: false, glow: 3 },
+  ];
+  layers.forEach((layer, idx) => {
+    const svg = document.createElementNS(svgns, 'svg');
+    svg.setAttribute('viewBox', '0 0 200 100');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.style.animation = `waveScroll ${layer.duration} linear infinite${layer.reverse ? ' reverse' : ''}`;
+    const path = document.createElementNS(svgns, 'path');
+    path.setAttribute('d', buildSeamlessWavePath(100, layer.amplitude, layer.waves, layer.baselineY, idx * 1.3));
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', layer.color);
+    path.setAttribute('stroke-width', layer.strokeWidth);
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('stroke-linejoin', 'round');
+    path.style.opacity = layer.opacity;
+    path.style.filter = `drop-shadow(0 0 ${layer.glow}px ${layer.color})`;
+    svg.appendChild(path);
+    fullWaveEl.appendChild(svg);
+  });
+  buildWaveBursts();
+}
+
+// Small glowing "spark" circles that scale up and fade out on a loop at
+// randomized positions/timing across the wave area — the extra bit of
+// energetic, pulsing motion that makes the whole thing read as more
+// alive/"explosive" rather than just three lines scrolling by.
+function buildWaveBursts() {
+  const colors = ['#e11d48', '#facc15', '#f8fafc'];
+  const burstCount = 10;
+  for (let i = 0; i < burstCount; i++) {
+    const burst = document.createElement('div');
+    burst.className = 'wave-burst';
+    burst.style.color = colors[i % colors.length];
+    burst.style.left = (5 + Math.random() * 90).toFixed(1) + '%';
+    burst.style.top = (15 + Math.random() * 60).toFixed(1) + '%';
+    burst.style.animationDuration = (1.6 + Math.random() * 1.8).toFixed(2) + 's';
+    burst.style.animationDelay = (Math.random() * 3).toFixed(2) + 's';
+    fullWaveEl.appendChild(burst);
+  }
+}
+buildFullWaveLines();
+const joinHeadingEl = document.getElementById('joinHeading');
+const joinSubEl = document.getElementById('joinSub');
 const joinBtn = document.getElementById('joinBtn');
 const winnerOverlay = document.getElementById('winnerOverlay');
 const winnerText = document.getElementById('winnerText');
@@ -113,6 +217,53 @@ winnerContactForm.addEventListener('submit', (e) => {
 
 document.getElementById('winnerCloseBtn').addEventListener('click', () => {
   winnerOverlay.style.display = 'none';
+});
+
+const thankYouOverlay = document.getElementById('thankYouOverlay');
+let thankYouAutoHideTimer = null;
+let confettiCleanupTimer = null;
+
+function spawnConfetti() {
+  // Clear any leftover pieces from a previous popup first — this can be
+  // called again (a second show-stop) before the last batch finished
+  // falling, and stale nodes would otherwise accumulate.
+  thankYouOverlay.querySelectorAll('.confetti-piece').forEach((el) => el.remove());
+  if (confettiCleanupTimer) clearTimeout(confettiCleanupTimer);
+
+  const colors = ['#e11d48', '#facc15', '#f8fafc'];
+  const count = 26;
+  let maxDuration = 0;
+  for (let i = 0; i < count; i++) {
+    const piece = document.createElement('div');
+    piece.className = 'confetti-piece';
+    piece.style.left = Math.random() * 100 + '%';
+    piece.style.background = colors[i % colors.length];
+    const duration = 1.6 + Math.random() * 1.4;
+    const delay = Math.random() * 0.5;
+    piece.style.animationDuration = duration.toFixed(2) + 's';
+    piece.style.animationDelay = delay.toFixed(2) + 's';
+    maxDuration = Math.max(maxDuration, duration + delay);
+    thankYouOverlay.appendChild(piece);
+  }
+  // Remove them once every piece has finished falling, rather than
+  // leaving finished (invisible but still-in-the-DOM) nodes around.
+  confettiCleanupTimer = setTimeout(() => {
+    thankYouOverlay.querySelectorAll('.confetti-piece').forEach((el) => el.remove());
+  }, (maxDuration + 0.3) * 1000);
+}
+
+function showThankYouOverlay() {
+  // A winner celebration always takes priority — never show this on top
+  // of (or instead of) that, so the two never compete for the screen.
+  if (winnerOverlay.style.display === 'flex') return;
+  thankYouOverlay.style.display = 'flex';
+  spawnConfetti();
+  if (thankYouAutoHideTimer) clearTimeout(thankYouAutoHideTimer);
+  thankYouAutoHideTimer = setTimeout(() => { thankYouOverlay.style.display = 'none'; }, 6000);
+}
+document.getElementById('thankYouCloseBtn').addEventListener('click', () => {
+  thankYouOverlay.style.display = 'none';
+  if (thankYouAutoHideTimer) { clearTimeout(thankYouAutoHideTimer); thankYouAutoHideTimer = null; }
 });
 
 // --- persistent per-device id (this is the giveaway de-dup key) ---
@@ -149,6 +300,7 @@ const deviceId = getDeviceId();
 // screen-flash fallback below, same as it always did.
 
 let torchTrack = null;
+let pendingReconnectTimer = null; // tracked so an immediate reconnect (visibilitychange) can cancel a stale scheduled one
 let offset = 0;
 let synced = false;
 let hasJoined = false; // becomes true once actually joined (auto via permission grant, or manual fallback tap)
@@ -242,17 +394,17 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     reacquireTorchIfNeeded();
     requestWakeLock();
-    // Clear any visual/torch state left over from before the tab was
-    // backgrounded — if a cue was mid-flash when the screen locked, the
-    // browser can leave setLight(true)'s last state stuck (torch left
-    // on, or the screen frozen white) once things resume, since the
-    // scheduled setTimeout that would have turned it back off may have
-    // been throttled/dropped entirely while suspended. Coming back to a
-    // clean OFF state and waiting for the next live cue is the right
-    // recovery — there's no good way to "catch up" a missed cue after
-    // the fact without looking out of sync with everyone else in the
-    // room, so this doesn't attempt to.
     setLight(false);
+    // If the WebSocket actually died while backgrounded (iOS in
+    // particular can fully suspend a tab after enough time, dropping
+    // the connection outright), don't wait for whatever's left of the
+    // jittered retry timer from the 'close' handler below — try right
+    // now instead, so coming back to the tab reconnects as fast as
+    // possible rather than however many seconds were left on that timer.
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      if (pendingReconnectTimer) { clearTimeout(pendingReconnectTimer); pendingReconnectTimer = null; }
+      connect();
+    }
   }
 });
 
@@ -263,9 +415,11 @@ document.addEventListener('visibilitychange', () => {
 // NOT and CANNOT prevent someone deliberately pressing the lock button
 // or switching to another app — no website can override that on iOS or
 // Android, it's a deliberate OS-level protection, not a bug. Supported
-// on modern Chrome/Android and Safari/iOS 16.4+; silently does nothing
-// on older/unsupported browsers, which just fall back to normal
-// screen-timeout behavior as before.
+// on Chrome/Android since 2020, desktop Safari since 16.4 (2023), and
+// — notably later — Safari on iOS only since iOS 18.4 (March 2025); on
+// an iPhone running an older iOS this silently does nothing, falling
+// back to normal screen-timeout behavior, same as any unsupported
+// browser (checked via 'wakeLock' in navigator, not a version sniff).
 let wakeLockSentinel = null;
 async function requestWakeLock() {
   if (!('wakeLock' in navigator)) return; // unsupported — nothing to do
@@ -346,16 +500,42 @@ function syncClock() {
   });
 }
 
+function setWaveMotion(running) {
+  document.querySelectorAll('#fullWave svg').forEach((svg) => {
+    svg.style.animationPlayState = running ? 'running' : 'paused';
+  });
+}
+
 function showActiveVisual() {
   statusEl.style.display = 'none';
-  showWaveEl.style.display = 'flex';
+  joinHeadingEl.style.display = 'none';
+  joinSubEl.style.display = 'none';
   liveLabelEl.style.display = 'block';
+  fullWaveEl.style.display = 'block';
+  setWaveMotion(true); // in case a previous pause left it frozen — a fresh cue/show always starts in motion
 }
 
 function hideActiveVisual() {
-  showWaveEl.style.display = 'none';
   liveLabelEl.style.display = 'none';
+  fullWaveEl.style.display = 'none';
   statusEl.style.display = 'block';
+  joinHeadingEl.style.display = '';
+  joinSubEl.style.display = '';
+}
+
+// A genuine pause (see 'show-pause' handler below) is DELIBERATELY
+// different from a full stop: the flash turns off (same cleanup as
+// stopContinuousShow — cancel every scheduled setTimeout, force the
+// light off) but the wave visual stays exactly where it is on screen,
+// just frozen mid-motion, rather than disappearing back to the join
+// instructions. Coming out of a pause (a fresh 'cue' or 'show-start'
+// arriving) naturally calls showActiveVisual() again, which unfreezes it.
+function pauseActiveVisual() {
+  if (showTimer) { clearInterval(showTimer); showTimer = null; }
+  scheduledLightTimeouts.forEach((id) => clearTimeout(id));
+  scheduledLightTimeouts = [];
+  setLight(false);
+  setWaveMotion(false);
 }
 
 // Every setTimeout scheduled by runPattern() (used for one-off cues AND,
@@ -430,8 +610,11 @@ function connect() {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'cue' && synced) runPattern(msg.pattern, msg.startAt);
     if (msg.type === 'show-start' && synced) startContinuousShow(msg.startAt, msg.mode, msg.intervalMs);
-    if (msg.type === 'show-stop') stopContinuousShow();
+    if (msg.type === 'show-stop') { stopContinuousShow(); showThankYouOverlay(); }
+    if (msg.type === 'show-pause') pauseActiveVisual();
     if (msg.type === 'winner') {
+      thankYouOverlay.style.display = 'none'; // a real win always takes priority over the generic thank-you
+      if (thankYouAutoHideTimer) { clearTimeout(thankYouAutoHideTimer); thankYouAutoHideTimer = null; }
       winnerText.textContent = msg.message;
       currentWinnerId = msg.winnerId || null;
       // Reset the contact form each time — covers the (rare) case of
@@ -459,12 +642,12 @@ function connect() {
   ws.addEventListener('close', () => {
     synced = false;
     wsReadyAndSynced = false;
-    setStatus('Disconnected — reconnecting…', false);
+    setStatus('Bağlantı kesildi — yeniden bağlanmak için sayfayı yenileyin (otomatik olarak da deneyecek)', false);
     // Randomized delay (1000-2500ms) instead of a fixed 1500ms — if the
     // server restarts, every connected phone hitting reconnect at the
     // exact same instant is a "thundering herd" that slams the server
     // the moment it comes back up. Jitter spreads that out.
-    setTimeout(connect, 1000 + Math.random() * 1500);
+    pendingReconnectTimer = setTimeout(connect, 1000 + Math.random() * 1500);
   });
 
   ws.addEventListener('error', () => ws.close());

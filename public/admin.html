@@ -88,6 +88,9 @@
   <p id="bpmHint" class="warn"></p>
   <button onclick="playAndSync()">▶ Play song + start lights</button>
   <button class="secondary" onclick="stopSong()">■ Stop</button>
+  <span id="playIndicator" title="Lit blue while the song is actually playing"
+    style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#444; margin-left:10px; vertical-align:middle; transition:background-color 0.15s, box-shadow 0.15s;"></span>
+  <span id="playIndicatorLabel" style="font-size:12px; opacity:0.6; margin-left:4px;">not playing</span>
 
   <h2>Giveaway</h2>
   <input type="text" id="winMsg" value="🎉 Congratulations! You've won a Göztepe jersey — please come to the fan desk." />
@@ -242,6 +245,7 @@ function showStart() {
 }
 function showStop() {
   if (!sendToServer({ type: 'show-stop' })) return;
+  suppressPauseHandlerOnce = true; // this pause() is a side effect of an intentional full stop, already sent above — don't ALSO fire genuine-pause handling for it
   document.getElementById('player').pause();
   log('Show stopped.');
 }
@@ -257,6 +261,76 @@ function showStop() {
 let generatedPattern = null;
 let generatedBpm = null;
 let generatedDurationMs = null;
+
+// Real playback-state indicator — separate from whether the admin merely
+// CLICKED play. player.play() can resolve without audio actually
+// producing sound yet (buffering, autoplay policy quirks, a bad file),
+// so this listens to the audio element's own real events instead of
+// just reacting to the button click.
+const playIndicatorEl = document.getElementById('playIndicator');
+const playIndicatorLabelEl = document.getElementById('playIndicatorLabel');
+function setPlayIndicator(isPlaying) {
+  playIndicatorEl.style.background = isPlaying ? '#2563eb' : '#444';
+  playIndicatorEl.style.boxShadow = isPlaying ? '0 0 10px #2563eb' : 'none';
+  playIndicatorLabelEl.textContent = isPlaying ? 'playing' : 'not playing';
+}
+
+// The <audio> element fires real 'playing'/'pause' events in THREE
+// different situations that all need different handling, even though
+// the browser doesn't distinguish them itself:
+//  1. The audio-unlock trick in playAndSync() (play() immediately
+//     followed by pause(), synchronously) — not a real pause at all.
+//  2. The explicit "Stop" button (showStop() calls player.pause()
+//     itself, and already sends its own 'show-stop' — don't ALSO fire
+//     genuine-pause handling for that).
+//  3. The browser's own automatic pause right before 'ended' fires at
+//     natural end-of-track (checked via player.ended) — 'ended' below
+//     handles that properly with the full stop + thank-you popup.
+// Only what's left after ruling those three out is a GENUINE pause —
+// the user (or admin) actually pausing mid-song — which should stop the
+// flash without any popup, and leave the wave visible but frozen.
+let suppressUnlockEvents = false;
+let suppressPauseHandlerOnce = false;
+let songShowStarted = false; // true once the real (post-unlock) playback has begun at least once this run
+
+document.getElementById('player').addEventListener('playing', () => {
+  setPlayIndicator(true);
+  if (suppressUnlockEvents) return; // the unlock trick's synthetic play — ignore
+  if (songShowStarted) {
+    // A genuine resume after a genuine pause — restart the light pattern
+    // in sync with the new playback position. This restarts the pattern
+    // from its beginning rather than truly resuming mid-track (doing a
+    // sample-accurate resume would need tracking the song's exact
+    // playback position and re-slicing the pattern to match) — simpler,
+    // and still gets the lights back in motion immediately.
+    if (generatedPattern && generatedPattern.length) {
+      sendToServer({ type: 'song-cue', pattern: generatedPattern });
+      log('Song resumed — light pattern restarted in sync.');
+    } else {
+      const intervalMs = bpmToIntervalMs();
+      sendToServer({ type: 'show-start', mode: 'pulse', intervalMs });
+      log('Song resumed — pulse restarted in sync.');
+    }
+  } else {
+    songShowStarted = true; // this IS the real initial start (already sent via playAndSync — nothing more to send here)
+  }
+});
+
+document.getElementById('player').addEventListener('pause', () => {
+  setPlayIndicator(false);
+  if (suppressUnlockEvents) { suppressUnlockEvents = false; return; }
+  if (suppressPauseHandlerOnce) { suppressPauseHandlerOnce = false; return; }
+  if (document.getElementById('player').ended) return; // natural end-of-track — 'ended' handler below takes it from here
+  sendToServer({ type: 'show-pause' });
+  log('Song paused — flash stopped (no announcement shown to fans).');
+});
+
+document.getElementById('player').addEventListener('ended', () => {
+  setPlayIndicator(false);
+  stopSong();
+});
+document.getElementById('player').addEventListener('stalled', () => setPlayIndicator(false));
+document.getElementById('player').addEventListener('waiting', () => setPlayIndicator(false));
 
 document.getElementById('audioFile').addEventListener('change', async (e) => {
   const file = e.target.files[0];
@@ -366,6 +440,7 @@ async function analyzeSongForBeats(arrayBuffer) {
   }
 
   const onsetTimesMs = onsetFrames.map((i) => Math.round((i * frameSize / sampleRate) * 1000));
+  const onsetStrengths = onsetFrames.map((i) => flux[i]); // how strong THIS hit is, relative to the others
 
   let bpm = null;
   if (onsetTimesMs.length > 4) {
@@ -376,12 +451,36 @@ async function analyzeSongForBeats(arrayBuffer) {
     if (median > 0) bpm = Math.round(60000 / median);
   }
 
+  // Every hit used to get the identical simple on/off blip regardless of
+  // how strong it actually was in the track — which is exactly why it
+  // could look like it was "flashing randomly" rather than reacting to
+  // the music: a quiet hi-hat tick and the song's biggest drop hit the
+  // exact same visual. This scales each hit's flash pattern to its
+  // actual relative strength within THIS song, so the strongest hits get
+  // a distinct, punchier double-flash (off, then fast back on) instead
+  // of the same flat blip as everything else — closer to how a real
+  // lighting operator would react to a track's actual dynamics.
+  const maxStrength = Math.max(...onsetStrengths, 0.0001);
   const FLASH_ON_MS = 90;
+  const STRONG_HIT_THRESHOLD = 0.65; // relative to this song's OWN strongest hit, not an absolute value
   const pattern = [];
-  for (const t of onsetTimesMs) {
-    pattern.push({ t, on: true });
-    pattern.push({ t: t + FLASH_ON_MS, on: false });
-  }
+  onsetTimesMs.forEach((t, idx) => {
+    const relStrength = onsetStrengths[idx] / maxStrength;
+    if (relStrength >= STRONG_HIT_THRESHOLD) {
+      // A standout hit: on, quick off, fast back on, off — a snappy
+      // double-flash that reads as a deliberate punctuation, not a
+      // random flicker. Both pulses fit well inside the ~340ms minimum
+      // gap already enforced between separate onsets, so this never
+      // collides with the next detected hit.
+      pattern.push({ t, on: true });
+      pattern.push({ t: t + 60, on: false });
+      pattern.push({ t: t + 100, on: true });
+      pattern.push({ t: t + 160, on: false });
+    } else {
+      pattern.push({ t, on: true });
+      pattern.push({ t: t + FLASH_ON_MS, on: false });
+    }
+  });
 
   return { pattern, bpm, onsetCount: onsetTimesMs.length, durationMs: Math.round(duration * 1000) };
 }
@@ -426,8 +525,14 @@ function playAndSync() {
   // cue lead time has elapsed) isn't blocked by mobile autoplay policies —
   // browsers require the FIRST play() to happen synchronously in a user
   // gesture, but allow later programmatic play() once that's happened once.
+  // This deliberately fires REAL 'playing' then 'pause' events on the
+  // element — suppressUnlockEvents tells both handlers below to ignore
+  // this one specific pair rather than treating it as a genuine pause.
   player.currentTime = 0;
-  player.play().then(() => player.pause()).catch(() => {});
+  suppressUnlockEvents = true;
+  player.play().then(() => player.pause()).catch(() => { suppressUnlockEvents = false; });
+
+  songShowStarted = false; // the next REAL 'playing' event is the genuine start, not a resume
 
   if (generatedPattern && generatedPattern.length) {
     if (!sendToServer({ type: 'song-cue', pattern: generatedPattern })) return;
