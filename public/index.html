@@ -97,6 +97,12 @@
     <p class="sub" id="joinSub">Işık şovu sırasında bağlantınızın kesilmemesi için lütfen telefonunuzu kilitlemeyin veya bu sayfadan ayrılmayın.</p>
     <button id="joinBtn" style="display:none">Işık Şovuna Katıl</button>
     <div id="status"><span class="dot off"></span>Bağlanıyor…</div>
+    <!-- Deliberately visible (not hidden/debug-only) — the only way to
+         diagnose a real device where the status claims torch is
+         available but the LED doesn't actually fire is to see exactly
+         what the browser itself reported, which requires a screenshot
+         from the actual failing phone. Small and unobtrusive on purpose. -->
+    <p id="diagInfo" style="font-size:11px; opacity:0.45; margin-top:14px; max-width:320px; line-height:1.5;"></p>
     <div id="liveLabel">Şov Başladı!</div>
   </div>
 
@@ -120,6 +126,21 @@
 <script>
 const statusEl = document.getElementById('status');
 const flashEl = document.getElementById('flash');
+const diagInfoEl = document.getElementById('diagInfo');
+
+// Real diagnostic state, filled in as it's actually learned — not
+// guessed. torchCapsResult/torchLastCallResult specifically exist
+// because the previous code silently swallowed every torch error via a
+// bare .catch(() => {}), which made an Android device that CLAIMS torch
+// is available but whose LED never lights completely undiagnosable
+// without exactly this kind of visible output from the real device.
+let diagTorchCaps = 'henüz kontrol edilmedi';
+let diagTorchLastCall = 'henüz denenmedi';
+function updateDiagInfo() {
+  const ua = navigator.userAgent.match(/(Chrome|CriOS|Safari|Firefox|FxiOS|SamsungBrowser)\/[\d.]+/g);
+  const uaShort = ua ? ua.join(' ') : navigator.userAgent.slice(0, 60);
+  diagInfoEl.textContent = `Tanı — Tarayıcı: ${uaShort} • Torch özelliği: ${diagTorchCaps} • Son fener komutu: ${diagTorchLastCall}`;
+}
 const torchKeepAliveEl = document.getElementById('torchKeepAlive');
 const liveLabelEl = document.getElementById('liveLabel');
 const fullWaveEl = document.getElementById('fullWave');
@@ -332,7 +353,9 @@ function setLight(on) {
     // screen white on top of that is redundant and, in a dark venue,
     // actively unpleasant (blinding, and defeats the point of the LED
     // being a small controlled light rather than the whole screen).
-    torchTrack.applyConstraints({ advanced: [{ torch: on }] }).catch(() => {});
+    torchTrack.applyConstraints({ advanced: [{ torch: on }] })
+      .then(() => { diagTorchLastCall = `başarılı (${on ? 'AÇIK' : 'KAPALI'})`; updateDiagInfo(); })
+      .catch((err) => { diagTorchLastCall = `HATA (${on ? 'AÇIK' : 'KAPALI'}): ${err.name}: ${err.message}`; updateDiagInfo(); });
   } else {
     // No real torch available — screen flash is the only fallback.
     flashEl.style.background = on ? '#ffffff' : '#000000';
@@ -360,6 +383,8 @@ async function requestCameraPermission() {
     const stream = await getRearCameraStream();
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : {};
+    diagTorchCaps = caps.torch ? 'var (torch:true)' : (track.getCapabilities ? 'yok (torch:false)' : 'getCapabilities() desteklenmiyor');
+    updateDiagInfo();
     // Permission grant is the join signal regardless of whether this
     // specific device actually has a controllable torch (e.g. a laptop's
     // built-in webcam has no torch, but granting access still counts as
@@ -378,7 +403,9 @@ async function requestCameraPermission() {
       track.stop();
     }
     cameraPermissionOutcome = true;
-  } catch {
+  } catch (err) {
+    diagTorchCaps = `kamera izni/erişimi başarısız: ${err && err.name ? err.name : err}`;
+    updateDiagInfo();
     cameraPermissionOutcome = false; // denied, no camera, or insecure context — manual fallback below
   }
   checkState();
