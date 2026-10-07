@@ -83,12 +83,20 @@
 </head>
 <body>
   <div id="flash"></div>
+  <!-- Deliberately not display:none or visibility:hidden — some Android
+       Chrome builds will suspend the underlying camera pipeline if the
+       stream has no actively-rendering consumer, which can make
+       applyConstraints({torch:true}) resolve successfully while the
+       real LED never actually lights. Rendering it off-screen (not
+       hidden) at 1x1px keeps the camera genuinely "live". -->
+  <video id="torchKeepAlive" autoplay playsinline muted
+    style="position:fixed; width:1px; height:1px; opacity:0; pointer-events:none; top:0; left:0;"></video>
   <div id="fullWave" aria-hidden="true"></div>
   <div id="ui">
     <h2 id="joinHeading">📱 Telefonunuzu Açık Tutun</h2>
     <p class="sub" id="joinSub">Işık şovu sırasında bağlantınızın kesilmemesi için lütfen telefonunuzu kilitlemeyin veya bu sayfadan ayrılmayın.</p>
-    <button id="joinBtn" style="display:none">Join the Light Show</button>
-    <div id="status"><span class="dot off"></span>Connecting…</div>
+    <button id="joinBtn" style="display:none">Işık Şovuna Katıl</button>
+    <div id="status"><span class="dot off"></span>Bağlanıyor…</div>
     <div id="liveLabel">Şov Başladı!</div>
   </div>
 
@@ -96,11 +104,11 @@
     <h1>🎉</h1>
     <p id="winnerText"></p>
     <form id="winnerContactForm">
-      <input type="text" id="winnerContactInput" placeholder="Phone number or email, to claim your prize" autocomplete="off" />
-      <button type="submit">Submit</button>
+      <input type="text" id="winnerContactInput" placeholder="Ödülünüzü almak için telefon numarası veya e-posta" autocomplete="off" />
+      <button type="submit">Gönder</button>
     </form>
     <p id="winnerContactStatus"></p>
-    <button id="winnerCloseBtn">Close</button>
+    <button id="winnerCloseBtn">Kapat</button>
   </div>
 
   <div id="thankYouOverlay">
@@ -112,6 +120,7 @@
 <script>
 const statusEl = document.getElementById('status');
 const flashEl = document.getElementById('flash');
+const torchKeepAliveEl = document.getElementById('torchKeepAlive');
 const liveLabelEl = document.getElementById('liveLabel');
 const fullWaveEl = document.getElementById('fullWave');
 
@@ -201,17 +210,17 @@ winnerContactForm.addEventListener('submit', (e) => {
   const contact = winnerContactInput.value.trim();
   if (!contact) return;
   if (!currentWinnerId) {
-    winnerContactStatus.textContent = "Something went wrong — try closing and reopening this, or tell the fan desk directly.";
+    winnerContactStatus.textContent = "Bir şeyler ters gitti — kapatıp tekrar açmayı deneyin ya da doğrudan görevlilere bildirin.";
     return;
   }
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'winner-contact', winnerId: currentWinnerId, contact }));
-    winnerContactStatus.textContent = 'Sending…';
+    winnerContactStatus.textContent = 'Gönderiliyor…';
   } else {
     // Not connected right now (e.g. a brief drop) — the reconnect logic
     // elsewhere in this file will restore the WebSocket on its own; the
     // person just needs to hit Submit again once status updates.
-    winnerContactStatus.textContent = "Not connected right now — wait a moment and try Submit again.";
+    winnerContactStatus.textContent = "Şu anda bağlı değilsiniz — biraz bekleyip tekrar Gönder'e dokunun.";
   }
 });
 
@@ -356,7 +365,18 @@ async function requestCameraPermission() {
     // built-in webcam has no torch, but granting access still counts as
     // "I'm in"). If there IS a torch, keep the track open to drive it;
     // otherwise release the camera immediately, we don't need it.
-    if (caps.torch) { torchTrack = track; hadTorchOnce = true; } else { track.stop(); }
+    if (caps.torch) {
+      torchTrack = track;
+      hadTorchOnce = true;
+      // Keep the camera pipeline genuinely active (see the <video>
+      // element's own comment) — some Android devices silently fail to
+      // actually drive the LED without this, even though the torch
+      // constraint call itself reports success.
+      torchKeepAliveEl.srcObject = stream;
+      torchKeepAliveEl.play().catch(() => {});
+    } else {
+      track.stop();
+    }
     cameraPermissionOutcome = true;
   } catch {
     cameraPermissionOutcome = false; // denied, no camera, or insecure context — manual fallback below
@@ -382,7 +402,13 @@ async function reacquireTorchIfNeeded() {
     const stream = await getRearCameraStream();
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (caps.torch) { torchTrack = track; } else { track.stop(); }
+    if (caps.torch) {
+      torchTrack = track;
+      torchKeepAliveEl.srcObject = stream;
+      torchKeepAliveEl.play().catch(() => {});
+    } else {
+      track.stop();
+    }
   } catch {
     // Couldn't reacquire (permission revoked in the meantime, camera
     // busy with another app, etc.) — setLight()'s existing torchTrack
@@ -445,14 +471,14 @@ function doJoin() {
   joinBtn.style.display = 'none';
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'join', deviceId }));
   requestWakeLock();
-  setStatus(torchTrack ? 'Flashlight enabled 🔦 — waiting for the show' : 'Screen-flash mode ready — waiting for the show', true);
+  setStatus(torchTrack ? 'Fener açık 🔦 — şov bekleniyor' : 'Ekran flaşı modu hazır — şov bekleniyor', true);
 }
 
 function showManualJoinFallback() {
   if (hasJoined) return;
-  joinBtn.textContent = 'Join the Light Show';
+  joinBtn.textContent = 'Işık Şovuna Katıl';
   joinBtn.style.display = '';
-  setStatus('Camera access unavailable — tap the button to join in screen-flash mode', true);
+  setStatus('Kamera erişimi yok — ekran flaşı moduyla katılmak için butona dokunun', true);
 }
 
 function checkState() {
@@ -462,9 +488,9 @@ function checkState() {
   } else if (cameraPermissionOutcome === false) {
     showManualJoinFallback();
   } else if (!wsReadyAndSynced) {
-    setStatus('Connecting…', false);
+    setStatus('Bağlanıyor…', false);
   } else {
-    setStatus('Waiting for camera permission — tap Allow when prompted', true);
+    setStatus('Kamera izni bekleniyor — istendiğinde İzin Ver\'e dokunun', true);
   }
 }
 
@@ -588,7 +614,7 @@ function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
 
   ws.addEventListener('open', async () => {
-    if (hasJoined) setStatus('Reconnected. Syncing…', false);
+    if (hasJoined) setStatus('Yeniden bağlandı. Senkronize ediliyor…', false);
     await syncClock();
     if (hasJoined) {
       // Reconnect after a drop — rejoin automatically (same deviceId, so
@@ -599,7 +625,7 @@ function connect() {
       // shouldn't delay the rejoin itself.
       reacquireTorchIfNeeded();
       ws.send(JSON.stringify({ type: 'join', deviceId }));
-      setStatus('Ready — waiting for the show to start', true);
+      setStatus('Hazır — şovun başlaması bekleniyor', true);
     } else {
       wsReadyAndSynced = true;
       checkState();
@@ -631,7 +657,7 @@ function connect() {
       try { if (navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 400]); } catch {}
     }
     if (msg.type === 'winner-contact-ok') {
-      winnerContactStatus.textContent = "✅ Thanks — we've got your info.";
+      winnerContactStatus.textContent = "✅ Teşekkürler — bilgileriniz alındı.";
       winnerContactForm.style.display = 'none';
     }
     if (msg.type === 'winner-contact-error') {

@@ -309,12 +309,12 @@ wss.on('connection', (ws, req) => {
       const winnerId = typeof msg.winnerId === 'string' ? msg.winnerId : null;
       const contact = typeof msg.contact === 'string' ? msg.contact.trim().slice(0, 200) : '';
       if (!winnerId || !contact) {
-        send(ws, { type: 'winner-contact-error', error: 'Missing contact info or winner reference.' });
+        send(ws, { type: 'winner-contact-error', error: 'İletişim bilgisi veya ödül referansı eksik.' });
         return;
       }
       const historyEntry = winnerHistory.find((h) => h.winnerId === winnerId);
       if (!historyEntry) {
-        send(ws, { type: 'winner-contact-error', error: 'This prize link is no longer valid.' });
+        send(ws, { type: 'winner-contact-error', error: 'Bu ödül bağlantısının süresi dolmuş.' });
         return;
       }
       historyEntry.contact = contact;
