@@ -378,12 +378,78 @@ async function getRearCameraStream() {
   }
 }
 
+// Real root cause of the Android "torch:false" reports: facingMode only
+// asks for SOME environment-facing camera, and on a modern multi-lens
+// Android phone (main + ultra-wide + macro/telephoto, all "environment"
+// facing) the browser is free to hand back ANY of them. It very commonly
+// hands back the ultra-wide or macro lens — which frequently has no torch
+// control exposed to the Web API at all — while the main lens, whose LED
+// is the actual flashlight, sits unused right next to it. The old code
+// took whatever single track facingMode happened to return and gave up if
+// it had no torch. This instead enumerates every physical rear camera and
+// probes each one directly by deviceId until it finds one that genuinely
+// reports torch:true, so a device isn't marked "no flashlight" just
+// because the browser's default lens pick for "environment" doesn't
+// happen to be the one with the LED. Only one camera is ever held open at
+// a time — every rejected candidate's track is stopped immediately.
+async function getRearCameraStreamWithTorch() {
+  let stream = await getRearCameraStream(); // throws if no camera access at all — let caller handle denial
+  let track = stream.getVideoTracks()[0];
+  let caps = track.getCapabilities ? track.getCapabilities() : {};
+  let usedAlternateLens = false;
+
+  if (caps.torch) {
+    return { stream, track, caps, usedAlternateLens };
+  }
+
+  let candidates = [];
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    candidates = devices.filter((d) => d.kind === 'videoinput');
+  } catch {
+    candidates = [];
+  }
+
+  for (const device of candidates) {
+    if (!device.deviceId) continue; // can be blank before permission is granted on some browsers
+    let altStream;
+    try {
+      altStream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: device.deviceId } },
+      });
+    } catch {
+      continue; // this deviceId failed (busy, invalid, front camera rejecting an exact constraint, etc.) — try the next
+    }
+    const altTrack = altStream.getVideoTracks()[0];
+    const altCaps = altTrack.getCapabilities ? altTrack.getCapabilities() : {};
+    // Skip anything that explicitly reports itself as front-facing — a
+    // front camera is never the one we want here, and never has a torch.
+    if (altCaps.facingMode && altCaps.facingMode.length && !altCaps.facingMode.includes('environment')) {
+      altTrack.stop();
+      continue;
+    }
+    if (altCaps.torch) {
+      // Found the lens with real torch control. Drop whatever we were
+      // holding before and switch to this one.
+      track.stop();
+      stream = altStream;
+      track = altTrack;
+      caps = altCaps;
+      usedAlternateLens = true;
+      break;
+    }
+    altTrack.stop(); // this lens has no torch either — release it and keep looking
+  }
+
+  return { stream, track, caps, usedAlternateLens };
+}
+
 async function requestCameraPermission() {
   try {
-    const stream = await getRearCameraStream();
-    const track = stream.getVideoTracks()[0];
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    diagTorchCaps = caps.torch ? 'var (torch:true)' : (track.getCapabilities ? 'yok (torch:false)' : 'getCapabilities() desteklenmiyor');
+    const { stream, track, caps, usedAlternateLens } = await getRearCameraStreamWithTorch();
+    diagTorchCaps = caps.torch
+      ? `var (torch:true)${usedAlternateLens ? ' — alternatif lens bulundu' : ''}`
+      : (track.getCapabilities ? 'yok (torch:false, tüm kameralar denendi)' : 'getCapabilities() desteklenmiyor');
     updateDiagInfo();
     // Permission grant is the join signal regardless of whether this
     // specific device actually has a controllable torch (e.g. a laptop's
@@ -426,9 +492,7 @@ async function reacquireTorchIfNeeded() {
   if (!hadTorchOnce) return;
   if (torchTrack && torchTrack.readyState === 'live') return;
   try {
-    const stream = await getRearCameraStream();
-    const track = stream.getVideoTracks()[0];
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    const { stream, track, caps } = await getRearCameraStreamWithTorch();
     if (caps.torch) {
       torchTrack = track;
       torchKeepAliveEl.srcObject = stream;
@@ -498,7 +562,14 @@ function doJoin() {
   joinBtn.style.display = 'none';
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'join', deviceId }));
   requestWakeLock();
-  setStatus(torchTrack ? 'Fener açık 🔦 — şov bekleniyor' : 'Ekran flaşı modu hazır — şov bekleniyor', true);
+  // Deliberately the SAME wording regardless of whether this device ended
+  // up using the real torch LED or the screen-flash fallback — from the
+  // participant's point of view both modes work (something on their
+  // phone will flash in time with the show), and showing different text
+  // on iOS vs. Android here was confusing people comparing phones
+  // side-by-side. The always-visible diagnostics line below still
+  // reports the real per-device torch capability honestly, for debugging.
+  setStatus('Işık şovu için hazır — şov bekleniyor 📱', true);
 }
 
 function showManualJoinFallback() {
