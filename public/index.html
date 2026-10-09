@@ -634,6 +634,13 @@ function showActiveVisual() {
   statusEl.style.display = 'none';
   joinHeadingEl.style.display = 'none';
   joinSubEl.style.display = 'none';
+  // The diagnostics line is only meant to help debug a specific phone
+  // before the show starts — once the wave animation is running it just
+  // sits behind/through the moving lines, cluttering the one thing the
+  // crowd should actually be looking at. Hide it for the duration of the
+  // show; hideActiveVisual() below brings it back once the show ends, so
+  // it's still there if a device needs re-checking afterward.
+  diagInfoEl.style.display = 'none';
   liveLabelEl.style.display = 'block';
   fullWaveEl.style.display = 'block';
   setWaveMotion(true); // in case a previous pause left it frozen — a fresh cue/show always starts in motion
@@ -645,6 +652,7 @@ function hideActiveVisual() {
   statusEl.style.display = 'block';
   joinHeadingEl.style.display = '';
   joinSubEl.style.display = '';
+  diagInfoEl.style.display = '';
 }
 
 // A genuine pause (see 'show-pause' handler below) is DELIBERATELY

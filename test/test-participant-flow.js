@@ -147,6 +147,41 @@ async function main() {
     await loseCtx.close();
     inst3.server.kill();
 
+    console.log('\nScenario: the diagnostics line is hidden during the show (was cluttering the wave animation) and comes back after');
+    const inst4 = freshServer();
+    await waitForHttp(`${inst4.base}/`);
+    const diagCtx = await browser.newContext();
+    const pageDiag = await diagCtx.newPage();
+    await installNoTorchRig(pageDiag);
+    await pageDiag.goto(`${inst4.base}/`);
+    await pageDiag.waitForTimeout(1800);
+    const diagVisibleBeforeShow = await pageDiag.evaluate(() => document.getElementById('diagInfo').style.display !== 'none');
+    assert(diagVisibleBeforeShow, 'diagnostics line is visible before the show starts (still useful for debugging a device)');
+
+    const admin4 = new WebSocket(`ws://localhost:${inst4.port}`);
+    await new Promise((resolve) => admin4.on('open', resolve));
+    admin4.send(JSON.stringify({ type: 'admin-auth', key: inst4.adminKey }));
+    await new Promise((resolve) => {
+      admin4.on('message', function handler(raw) {
+        const m = JSON.parse(raw);
+        if (m.type === 'admin-auth-ok') { admin4.removeListener('message', handler); resolve(); }
+      });
+    });
+    admin4.send(JSON.stringify({ type: 'show-start', mode: 'solid', intervalMs: 500 }));
+    await pageDiag.waitForTimeout(3200); // past LEAD_TIME_MS so the cue has actually arrived and fired
+    const diagHiddenDuringShow = await pageDiag.evaluate(() => document.getElementById('diagInfo').style.display === 'none');
+    assert(diagHiddenDuringShow, 'diagnostics line is hidden once the wave animation is actually running');
+
+    admin4.send(JSON.stringify({ type: 'show-stop' }));
+    await pageDiag.waitForTimeout(500);
+    const diagVisibleAfterShow = await pageDiag.evaluate(() => document.getElementById('diagInfo').style.display !== 'none');
+    assert(diagVisibleAfterShow, 'diagnostics line reappears after the show stops, so a device can still be debugged afterward');
+
+    admin4.close();
+    await pageDiag.close();
+    await diagCtx.close();
+    inst4.server.kill();
+
   } finally {
     await browser.close();
   }
